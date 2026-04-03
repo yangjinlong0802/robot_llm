@@ -303,6 +303,17 @@ class ActionConfigDialog(QDialog):
             form_layout.addRow("枪位:", self.gun_position_combo)
             form_layout.addRow("取/放:", self.operation_combo)
 
+        elif self.action_type == ActionType.VISION_CAPTURE:
+            # 视觉抓取参数已固定：robot1 / bottle / 置信度0.7 / 速度15 / 夹爪150mm
+            fixed_label = QLabel(
+                "固定配置：Robot1 (左臂) | 工作流: bottle | 置信度: 0.7 | "
+                "速度: 15mm/s | 夹爪: 150mm | 调试图片: 开"
+            )
+            fixed_label.setStyleSheet("color: #666; font-size: 12px; padding: 4px;")
+            fixed_label.setWordWrap(True)
+
+            form_layout.addRow("", fixed_label)
+
         layout.addLayout(form_layout)
 
         buttons = QDialogButtonBox(
@@ -320,7 +331,8 @@ class ActionConfigDialog(QDialog):
             ActionType.MOVE: "移动",
             ActionType.MANIPULATE: "机械臂",
             ActionType.INSPECT: "检测",
-            ActionType.CHANGE_GUN: "换枪"
+            ActionType.CHANGE_GUN: "换枪",
+            ActionType.VISION_CAPTURE: "视觉抓取"
         }
         return type_map.get(self.action_type, "")
 
@@ -414,6 +426,15 @@ class ActionConfigDialog(QDialog):
             parameters = {
                 'Gun_Position': self.gun_position_combo.currentData(),
                 'Operation': self.operation_combo.currentText()
+            }
+        elif self.action_type == ActionType.VISION_CAPTURE:
+            parameters = {
+                '目标机械臂': 'robot1',
+                '工作流': 'bottle',
+                '置信度': 0.7,
+                '调试图片': True,
+                '移动速度': 15,
+                '夹爪长度': 150.0
             }
 
         return ActionDefinition(

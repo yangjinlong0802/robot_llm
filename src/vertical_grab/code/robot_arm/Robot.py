@@ -107,6 +107,11 @@ class RobotController:
         self.gripper_offset = [3.146, 0, 3.128]  # 侧装的垂直姿态
         self.translation_vector = [-0.10273135, 0.03312807, -0.07214614]
 
+        # 按需帧注入槽（由 OnDemandFrameGrabber 填充）
+        self._injected_color = None
+        self._injected_depth = None
+        self._injected_intr = None
+
         # 加载模型
         self.yolo_model = YOLO("/home/maic/10-robotgui/src/best.pt")
         self.sam_model = SAM("/home/maic/10-robotgui/src/sam2.1_l.pt")
@@ -148,8 +153,22 @@ class RobotController:
         
         return new_mask
 
+    def inject_frames(self, color, depth, intrinsics):
+        """注入帧数据，供 get_frames_from_gui() 直接返回（绕过 socket）。"""
+        self._injected_color = color
+        self._injected_depth = depth
+        self._injected_intr = intrinsics
+
     def get_frames_from_gui(self, max_retries=3, timeout=5):
-        """从GUI获取帧数据"""
+        """从GUI获取帧数据，优先返回 inject_frames 注入的数据。"""
+        # 优先返回已注入的帧数据（由 OnDemandFrameGrabber 填充）
+        if self._injected_color is not None:
+            color = self._injected_color
+            depth = self._injected_depth
+            intr = self._injected_intr
+            self._injected_color = None  # 用完清空，防止复用
+            return color, depth, intr
+
         retries = 0
         while retries < max_retries:
             try:

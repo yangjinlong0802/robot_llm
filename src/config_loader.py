@@ -23,6 +23,7 @@ class Config:
     LOG_LEVEL: str = "INFO"
     SIMULATION_MODE: bool = False
     SKILL_LIBRARY_PATH: str = "data/skills/skill_library.json"
+    REALSENSE_DEVICE_SN: str = ""
 
     def __new__(cls):
         if cls._instance is None:
@@ -64,6 +65,7 @@ class Config:
         instance.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         instance.SIMULATION_MODE = os.getenv("SIMULATION_MODE", "false").lower() in ("true", "1", "yes")
         instance.SKILL_LIBRARY_PATH = os.getenv("SKILL_LIBRARY_PATH", "data/skills/skill_library.json")
+        instance.REALSENSE_DEVICE_SN = os.getenv("REALSENSE_DEVICE_SN", "")
 
         cls._loaded = True
         return instance

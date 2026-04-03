@@ -1,11 +1,12 @@
 import sys
+import time
 import os
 from pathlib import Path
 from typing import List
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
                             QSplitter, QMessageBox, QFileDialog, QMenu,
                             QTabWidget, QPushButton, QLabel, QFrame)
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QPalette, QColor
 
 # 设置路径 - 必须在导入 execution 之前
@@ -47,7 +48,8 @@ class MainWindow(QMainWindow):
             ActionType.MOVE: [],
             ActionType.MANIPULATE: [],
             ActionType.INSPECT: [],
-            ActionType.CHANGE_GUN: []
+            ActionType.CHANGE_GUN: [],
+            ActionType.VISION_CAPTURE: []
         }
         self.execution_thread: ExecutionThread = None
         self.is_paused = False
@@ -74,8 +76,9 @@ class MainWindow(QMainWindow):
         # 自动初始化机械臂和移液枪
         if ROBOT_AVAILABLE:
             self.auto_initialize()
-        if MODBUS_AVAILABLE:
-            self.initialize_body()
+        # 注释掉下面 2 行，防止启动时升降平台高度变化
+        # if MODBUS_AVAILABLE:
+        #     self.initialize_body()
 
     def init_ui(self):
         self.setWindowTitle("Robot Action Orchestrator")
@@ -145,11 +148,13 @@ class MainWindow(QMainWindow):
         self.manipulate_list = ActionListWidget()
         self.inspect_list = ActionListWidget()
         self.change_gun_list = ActionListWidget()
+        self.vision_capture_list = ActionListWidget()
 
         self.action_tabs.addTab(self.move_list, "移动类")
         self.action_tabs.addTab(self.manipulate_list, "执行类")
         self.action_tabs.addTab(self.inspect_list, "检测类")
         self.action_tabs.addTab(self.change_gun_list, "换枪类")
+        self.action_tabs.addTab(self.vision_capture_list, "视觉类")
 
         # AI助手 Tab
         self.ai_assistant_widget = AIAssistantWidget()
@@ -168,6 +173,12 @@ class MainWindow(QMainWindow):
         self.delete_btn.clicked.connect(self.delete_action)
         btn_layout.addWidget(self.create_btn)
         btn_layout.addWidget(self.delete_btn)
+
+        self.test_camera_btn = QPushButton("测试相机")
+        self.test_camera_btn.setMinimumHeight(32)
+        self.test_camera_btn.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+        self.test_camera_btn.clicked.connect(self.test_camera)
+        btn_layout.addWidget(self.test_camera_btn)
         layout.addLayout(btn_layout)
 
         return panel
@@ -389,7 +400,8 @@ class MainWindow(QMainWindow):
             0: ActionType.MOVE,
             1: ActionType.MANIPULATE,
             2: ActionType.INSPECT,
-            3: ActionType.CHANGE_GUN
+            3: ActionType.CHANGE_GUN,
+            4: ActionType.VISION_CAPTURE
         }
         action_type = action_type_map.get(current_tab)
 
@@ -406,7 +418,8 @@ class MainWindow(QMainWindow):
             0: ActionType.MOVE,
             1: ActionType.MANIPULATE,
             2: ActionType.INSPECT,
-            3: ActionType.CHANGE_GUN
+            3: ActionType.CHANGE_GUN,
+            4: ActionType.VISION_CAPTURE
         }
         action_type = action_type_map.get(current_tab)
 
@@ -414,7 +427,8 @@ class MainWindow(QMainWindow):
             ActionType.MOVE: self.move_list,
             ActionType.MANIPULATE: self.manipulate_list,
             ActionType.INSPECT: self.inspect_list,
-            ActionType.CHANGE_GUN: self.change_gun_list
+            ActionType.CHANGE_GUN: self.change_gun_list,
+            ActionType.VISION_CAPTURE: self.vision_capture_list
         }
         action_list = list_map[action_type]
 
@@ -434,7 +448,8 @@ class MainWindow(QMainWindow):
             ActionType.MOVE: self.move_list,
             ActionType.MANIPULATE: self.manipulate_list,
             ActionType.INSPECT: self.inspect_list,
-            ActionType.CHANGE_GUN: self.change_gun_list
+            ActionType.CHANGE_GUN: self.change_gun_list,
+            ActionType.VISION_CAPTURE: self.vision_capture_list
         }
         action_list = list_map[action_type]
         action_list.clear()
@@ -622,6 +637,71 @@ class MainWindow(QMainWindow):
         self.sequence_list.clear()
         for item in sequence:
             self.sequence_list.add_sequence_item(item)
+
+    def test_camera(self):
+        """
+        在独立 QThread 中测试 RealSense pipeline。
+        QThread 有自己的 Qt 事件循环，能正确处理 RealSense SDK 的 USB urb 回调。
+        """
+        self.test_camera_btn.setEnabled(False)
+        self.test_camera_btn.setText("测试中...")
+
+        class _TestWorker(QThread):
+            result = pyqtSignal(bool, str)
+
+            def run(self):
+                import pyrealsense2 as rs
+                from src.config_loader import Config
+
+                sn = Config.get_instance().REALSENSE_DEVICE_SN
+
+                try:
+                    ctx = rs.context()
+                    devices = list(ctx.devices)
+                    if not devices:
+                        self.result.emit(False, "未检测到 RealSense 设备")
+                        return
+
+                    pipeline = rs.pipeline()
+                    cfg = rs.config()
+                    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                    if sn:
+                        cfg.enable_device(sn)
+                    profile = pipeline.start(cfg)
+
+                    time.sleep(1)
+
+                    deadline = time.time() + 10
+                    while time.time() < deadline:
+                        try:
+                            frames = pipeline.wait_for_frames(200)
+                            color = frames.get_color_frame()
+                            depth = frames.get_depth_frame()
+                            if color and depth:
+                                msg = (f"SUCCESS: color={color.width}x{color.height}  "
+                                       f"depth={depth.get_distance(320, 240):.3f}m  "
+                                       f"(SN={sn or 'auto-select'})")
+                                pipeline.stop()
+                                self.result.emit(True, msg)
+                                return
+                        except Exception:
+                            pass
+
+                    pipeline.stop()
+                    self.result.emit(False, "取帧超时（10 秒内未获得有效帧）")
+
+                except Exception as e:
+                    self.result.emit(False, str(e))
+
+        def on_result(success, msg):
+            self.log_widget.append_log(f"[相机测试] {msg}")
+            self.test_camera_btn.setEnabled(True)
+            self.test_camera_btn.setText("测试相机")
+
+        self._camera_test_thread = _TestWorker()
+        self._camera_test_thread.result.connect(on_result)
+        self._camera_test_thread.start()
 
     def closeEvent(self, event):
         if self.execution_thread and self.execution_thread.isRunning():

@@ -55,7 +55,8 @@ class ActionListWidget(QListWidget):
             ActionType.MOVE: QColor(100, 149, 237),
             ActionType.MANIPULATE: QColor(255, 140, 0),
             ActionType.INSPECT: QColor(60, 179, 113),
-            ActionType.CHANGE_GUN: QColor(147, 112, 219)
+            ActionType.CHANGE_GUN: QColor(147, 112, 219),
+            ActionType.VISION_CAPTURE: QColor(30, 144, 255),
         }
         color = colors.get(action_type, QColor(128, 128, 128))
         return self._create_colored_icon(color)
@@ -174,7 +175,8 @@ class SequenceListWidget(QListWidget):
             ActionType.MOVE: QColor(100, 149, 237),
             ActionType.MANIPULATE: QColor(255, 140, 0),
             ActionType.INSPECT: QColor(60, 179, 113),
-            ActionType.CHANGE_GUN: QColor(147, 112, 219)
+            ActionType.CHANGE_GUN: QColor(147, 112, 219),
+            ActionType.VISION_CAPTURE: QColor(30, 144, 255),
         }
 
         if status == SequenceItemStatus.RUNNING:
@@ -207,7 +209,8 @@ class SequenceListWidget(QListWidget):
             ActionType.MOVE: QColor(100, 149, 237),
             ActionType.MANIPULATE: QColor(255, 140, 0),
             ActionType.INSPECT: QColor(60, 179, 113),
-            ActionType.CHANGE_GUN: QColor(147, 112, 219)
+            ActionType.CHANGE_GUN: QColor(147, 112, 219),
+            ActionType.VISION_CAPTURE: QColor(30, 144, 255),
         }
 
         if status == SequenceItemStatus.RUNNING:
