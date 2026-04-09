@@ -19,7 +19,8 @@ class Config:
     # 配置项
     OPENAI_API_KEY: str = ""
     OPENAI_MODEL: str = "gpt-4o"
-    MODEL_PROVIDER: str = "openai"  # 可选: "openai" 或 "deepseek"
+    OPENAI_BASE_URL: str = ""  # 自定义 API 地址，留空使用各提供商默认值
+    MODEL_PROVIDER: str = "openai"  # 可选: "openai" / "deepseek" / "dashscope"
     LOG_LEVEL: str = "INFO"
     SIMULATION_MODE: bool = False
     SKILL_LIBRARY_PATH: str = "data/skills/skill_library.json"
@@ -61,6 +62,7 @@ class Config:
         instance = cls._instance
         instance.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
         instance.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+        instance.OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
         instance.MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "openai")
         instance.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
         instance.SIMULATION_MODE = os.getenv("SIMULATION_MODE", "false").lower() in ("true", "1", "yes")

@@ -17,13 +17,15 @@ class OpenAIClient(LLMClient):
     使用 OpenAI API 进行意图理解和动作规划
     """
 
-    def __init__(self, api_key: str, model: str = "gpt-4o"):
+    def __init__(self, api_key: str, model: str = "gpt-4o", base_url: str = ""):
         """
-        初始化 OpenAI 客户端
+        初始化 OpenAI 兼容客户端
 
         Args:
-            api_key: OpenAI API Key
+            api_key: API Key
             model: 模型名称，默认为 gpt-4o
+            base_url: 自定义 API 地址，留空使用 OpenAI 官方地址。
+                      阿里云百炼: https://dashscope.aliyuncs.com/compatible-mode/v1
         """
         self._api_key = api_key
         self._model = model
@@ -33,9 +35,14 @@ class OpenAIClient(LLMClient):
         # 尝试导入 openai 并初始化
         try:
             from openai import OpenAI
-            self._client = OpenAI(api_key=api_key)
+            # 支持自定义 base_url（阿里云百炼、Azure 等兼容 OpenAI 协议的服务）
+            kwargs = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            self._client = OpenAI(**kwargs)
             self._available = True
-            logger.info(f"OpenAI 客户端初始化成功，使用模型: {model}")
+            url_info = f", base_url={base_url}" if base_url else ""
+            logger.info(f"OpenAI 客户端初始化成功，使用模型: {model}{url_info}")
         except ImportError:
             logger.error("OpenAI SDK 未安装，请运行: pip install openai")
             self._available = False

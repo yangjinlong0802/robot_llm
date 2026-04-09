@@ -15,6 +15,7 @@ WebSocket 服务端
 
     === 动作库管理 ===
         {"action": "list_actions"}                         获取动作库（按类型分组）
+        {"action": "get_action_schema"}                    获取动作类型参数结构定义（供前端动态生成表单）
         {"action": "create_action", "name": "...", "type": "MOVE_TO_POINT", "parameters": {...}}
         {"action": "delete_action", "id": "..."}           删除动作
         {"action": "update_action", "id": "...", "name": "...", "type": "...", "parameters": {...}}
@@ -196,17 +197,30 @@ class RobotWebSocketServer:
             # 初始化 LLM 客户端
             if config.OPENAI_API_KEY:
                 provider = config.MODEL_PROVIDER.lower()
+                base_url = config.OPENAI_BASE_URL
+
                 if provider == "deepseek":
                     from .llm import DeepSeekClient
                     self._llm_client = DeepSeekClient(
                         api_key=config.OPENAI_API_KEY,
                         model=config.OPENAI_MODEL or "deepseek-reasoner",
+                        base_url=base_url,
+                    )
+                elif provider == "dashscope":
+                    # 阿里云百炼，兼容 OpenAI 协议
+                    from .llm import OpenAIClient
+                    self._llm_client = OpenAIClient(
+                        api_key=config.OPENAI_API_KEY,
+                        model=config.OPENAI_MODEL or "qwen-plus",
+                        base_url=base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
                     )
                 else:
+                    # OpenAI 或其他兼容服务
                     from .llm import OpenAIClient
                     self._llm_client = OpenAIClient(
                         api_key=config.OPENAI_API_KEY,
                         model=config.OPENAI_MODEL or "gpt-4o",
+                        base_url=base_url,
                     )
 
                 if self._llm_client.is_available():
@@ -266,6 +280,7 @@ class RobotWebSocketServer:
             "resume":        self._handle_resume,
             # 动作库管理
             "list_actions":  self._handle_list_actions,
+            "get_action_schema": self._handle_get_action_schema,
             "create_action": self._handle_create_action,
             "delete_action": self._handle_delete_action,
             "update_action": self._handle_update_action,
@@ -448,6 +463,115 @@ class RobotWebSocketServer:
             "event": "actions_list",
             "actions": grouped,
             "total": len(all_actions),
+        }))
+
+    async def _handle_get_action_schema(self, websocket, data: dict) -> None:
+        """
+        返回所有动作类型的参数结构定义，前端可据此动态生成表单
+        请求: {"action": "get_action_schema"}
+        响应: {"event": "action_schema", "types": {...}}
+        """
+        schema = {
+            "MOVE_TO_POINT": {
+                "label": "移动类",
+                "description": "机械臂移动 / 升降平台移动",
+                "variants": {
+                    "机械臂": {
+                        "description": "控制机械臂移动到指定点位",
+                        "fields": {
+                            "目标": {"type": "select", "options": ["机械臂"], "default": "机械臂", "label": "目标"},
+                            "臂":   {"type": "select", "options": ["左", "右"], "default": "左", "label": "臂"},
+                            "模式": {"type": "select", "options": [
+                                {"value": "move_j", "label": "关节运动 (move_j)"},
+                                {"value": "move_l", "label": "直线运动 (move_l)"}
+                            ], "default": "move_j", "label": "运动模式"},
+                            "点位": {"type": "text", "placeholder": "例如: [-0.048, -0.269, -0.101, 3.109, -0.094, -1.592]", "label": "点位", "required": True}
+                        }
+                    },
+                    "身体": {
+                        "description": "控制升降平台移动到指定位置",
+                        "fields": {
+                            "目标": {"type": "select", "options": ["身体"], "default": "身体", "label": "目标"},
+                            "位置": {"type": "number", "min": 0, "max": 500000, "default": 0, "unit": "脉冲", "label": "目标位置"}
+                        }
+                    }
+                },
+                "variant_key": "目标"
+            },
+            "ARM_ACTION": {
+                "label": "执行类",
+                "description": "快换手、继电器、夹爪、吸液枪等执行器操作",
+                "variants": {
+                    "快换手": {
+                        "description": "控制快换手开关",
+                        "fields": {
+                            "执行器": {"type": "select", "options": ["快换手"], "default": "快换手", "label": "执行器"},
+                            "编号":   {"type": "select", "options": [1, 2], "default": 1, "label": "编号"},
+                            "操作":   {"type": "select", "options": ["开", "关"], "default": "开", "label": "操作"}
+                        }
+                    },
+                    "继电器": {
+                        "description": "控制继电器开关",
+                        "fields": {
+                            "执行器": {"type": "select", "options": ["继电器"], "default": "继电器", "label": "执行器"},
+                            "编号":   {"type": "select", "options": [1, 2], "default": 1, "label": "编号"},
+                            "操作":   {"type": "select", "options": ["开", "关"], "default": "开", "label": "操作"}
+                        }
+                    },
+                    "夹爪": {
+                        "description": "控制夹爪开关",
+                        "fields": {
+                            "执行器": {"type": "select", "options": ["夹爪"], "default": "夹爪", "label": "执行器"},
+                            "编号":   {"type": "select", "options": [1, 2], "default": 1, "label": "编号"},
+                            "操作":   {"type": "select", "options": ["开", "关"], "default": "开", "label": "操作"}
+                        }
+                    },
+                    "吸液枪": {
+                        "description": "控制吸液枪吸液/吐液",
+                        "fields": {
+                            "执行器": {"type": "select", "options": ["吸液枪"], "default": "吸液枪", "label": "执行器"},
+                            "操作":   {"type": "select", "options": ["吸", "吐"], "default": "吸", "label": "操作"},
+                            "容量":   {"type": "number", "min": 0, "max": 10000, "default": 500, "unit": "ul", "label": "容量"}
+                        }
+                    }
+                },
+                "variant_key": "执行器"
+            },
+            "INSPECT_AND_OUTPUT": {
+                "label": "检测类",
+                "description": "传感器读取与阈值判定",
+                "fields": {
+                    "Sensor_ID": {"type": "text", "label": "传感器 ID", "required": True},
+                    "Threshold": {"type": "number", "min": -9999, "max": 9999, "default": 0, "label": "判定阈值"},
+                    "Timeout":   {"type": "number", "min": 0.1, "max": 60, "default": 5, "unit": "s", "label": "超时时间"}
+                }
+            },
+            "CHANGE_GUN": {
+                "label": "换枪类",
+                "description": "取/放工具头",
+                "fields": {
+                    "Gun_Position": {"type": "select", "options": [1, 2], "default": 1, "label": "枪位"},
+                    "Operation":    {"type": "select", "options": ["取", "放"], "default": "取", "label": "取/放"}
+                }
+            },
+            "VISION_CAPTURE": {
+                "label": "视觉类",
+                "description": "视觉识别 + 自动抓取（参数已固定）",
+                "fields": {
+                    "目标机械臂": {"type": "text", "default": "robot1", "label": "目标机械臂", "readonly": True},
+                    "工作流":     {"type": "text", "default": "bottle", "label": "工作流", "readonly": True},
+                    "置信度":     {"type": "number", "default": 0.7, "label": "置信度", "readonly": True},
+                    "调试图片":   {"type": "boolean", "default": True, "label": "调试图片", "readonly": True},
+                    "移动速度":   {"type": "number", "default": 15, "unit": "mm/s", "label": "移动速度", "readonly": True},
+                    "夹爪长度":   {"type": "number", "default": 150.0, "unit": "mm", "label": "夹爪长度", "readonly": True}
+                },
+                "note": "视觉抓取参数已固定，前端仅需填写动作名称即可"
+            }
+        }
+
+        await websocket.send(self._json_msg({
+            "event": "action_schema",
+            "types": schema,
         }))
 
     async def _handle_create_action(self, websocket, data: dict) -> None:

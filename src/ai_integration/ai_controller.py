@@ -89,20 +89,35 @@ class AIController(QObject):
         # 初始化 LLM（根据配置的提供商选择）
         if self._config.OPENAI_API_KEY:
             provider = self._config.MODEL_PROVIDER.lower()
+            base_url = getattr(self._config, 'OPENAI_BASE_URL', '')
+
             if provider == "deepseek":
                 self._llm_client = DeepSeekClient(
                     api_key=self._config.OPENAI_API_KEY,
-                    model=self._config.OPENAI_MODEL or "deepseek-reasoner"
+                    model=self._config.OPENAI_MODEL or "deepseek-reasoner",
+                    base_url=base_url,
                 )
                 if self._llm_client.is_available():
                     logger.info(f"DeepSeek 客户端就绪，使用模型: {self._llm_client.get_model_name()}")
                 else:
                     logger.warning("DeepSeek 客户端不可用，请检查 API Key")
-            else:
-                # 默认使用 OpenAI
+            elif provider == "dashscope":
+                # 阿里云百炼，兼容 OpenAI 协议
                 self._llm_client = OpenAIClient(
                     api_key=self._config.OPENAI_API_KEY,
-                    model=self._config.OPENAI_MODEL or "gpt-4o"
+                    model=self._config.OPENAI_MODEL or "qwen-plus",
+                    base_url=base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                )
+                if self._llm_client.is_available():
+                    logger.info(f"百炼客户端就绪，使用模型: {self._llm_client.get_model_name()}")
+                else:
+                    logger.warning("百炼客户端不可用，请检查 API Key")
+            else:
+                # OpenAI 或其他兼容服务
+                self._llm_client = OpenAIClient(
+                    api_key=self._config.OPENAI_API_KEY,
+                    model=self._config.OPENAI_MODEL or "gpt-4o",
+                    base_url=base_url,
                 )
                 if self._llm_client.is_available():
                     logger.info(f"LLM 客户端就绪，使用模型: {self._llm_client.get_model_name()}")

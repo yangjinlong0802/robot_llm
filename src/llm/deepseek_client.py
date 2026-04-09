@@ -19,9 +19,9 @@ class DeepSeekClient(LLMClient):
     API 格式与 OpenAI 兼容
     """
 
-    BASE_URL = "https://api.deepseek.com/v1"
+    DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 
-    def __init__(self, api_key: str, model: str = "deepseek-reasoner"):
+    def __init__(self, api_key: str, model: str = "deepseek-reasoner", base_url: str = ""):
         """
         初始化 DeepSeek 客户端
 
@@ -29,17 +29,19 @@ class DeepSeekClient(LLMClient):
             api_key: DeepSeek API Key
             model: 模型名称，默认为 deepseek-reasoner (R1)
                   其他可选: deepseek-chat (V3)
+            base_url: 自定义 API 地址，留空使用 DeepSeek 官方地址
         """
         self._api_key = api_key
         self._model = model
         self._client = None
         self._available = False
+        self._base_url = base_url or self.DEFAULT_BASE_URL
 
         try:
             from openai import OpenAI
             self._client = OpenAI(
                 api_key=api_key,
-                base_url=self.BASE_URL
+                base_url=self._base_url
             )
             self._available = True
             logger.info(f"DeepSeek 客户端初始化成功，使用模型: {model}")
