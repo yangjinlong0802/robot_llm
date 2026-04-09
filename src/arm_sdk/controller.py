@@ -3,12 +3,12 @@ import time
 import numpy as np
 from ultralytics import YOLO, SAM
 from ..vision.interface import vertical_catch
-from .rm_robot_interface import *
 import os
 from sklearn.mixture import GaussianMixture
 import socket
 import pickle
 import struct
+from Robotic_Arm.rm_robot_interface import *
 
 # 先确保配置已加载，再导入配置值
 from .config import ensure_config_loaded

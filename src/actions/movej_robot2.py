@@ -4,8 +4,8 @@
 """
 import os
 import time
+from Robotic_Arm.rm_robot_interface import *
 
-from ..arm_sdk.rm_robot_interface import *
 from ..arm_sdk.config import ROBOT2_CONFIG, MOVE_CONFIG
 
 

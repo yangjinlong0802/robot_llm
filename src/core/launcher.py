@@ -15,6 +15,8 @@ import os
 import argparse
 import logging
 
+from ..arm_sdk.controller import RobotController
+
 
 def setup_logging(level: str = "INFO") -> None:
     """配置日志"""
@@ -39,7 +41,7 @@ def init_hardware(simulation: bool = False):
 
     # 初始化机械臂
     try:
-        from ..arm_sdk import RobotController
+        # from ..arm_sdk import RobotController
         print("正在初始化机械臂...")
         robot_controller = RobotController()
 

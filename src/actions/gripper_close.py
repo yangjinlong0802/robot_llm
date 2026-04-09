@@ -3,8 +3,7 @@
 Robot1 夹爪关闭
 """
 import time
-
-from ..arm_sdk.rm_robot_interface import *
+from Robotic_Arm.rm_robot_interface import *
 from ..arm_sdk.config import ROBOT1_CONFIG, GRIPPER_CONFIG
 
 

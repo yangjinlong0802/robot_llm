@@ -42,6 +42,7 @@ import pickle
 import struct
 import threading
 from typing import Optional, Literal, Tuple, Any, Callable
+from Robotic_Arm.rm_robot_interface import *
 
 import cv2
 import numpy as np
@@ -54,7 +55,6 @@ from ultralytics import YOLO, SAM
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PICTURE_DIR_DEFAULT = os.path.join(_THIS_DIR, "pictures")
 
-from ..arm_sdk.rm_robot_interface import *
 from .interface import vertical_catch
 
 try:

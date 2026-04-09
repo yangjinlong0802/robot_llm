@@ -5,8 +5,7 @@
 """
 import sys
 import os
-
-from ..arm_sdk.rm_robot_interface import *
+from Robotic_Arm.rm_robot_interface import *
 from ..arm_sdk.config import ROBOT2_CONFIG, GUN1_POSITIONS, MOVE_CONFIG
 
 

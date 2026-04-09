@@ -81,6 +81,7 @@ except ImportError:
 from ..core.models import ActionDefinition, ActionType, SequenceItem, SequenceItemStatus
 from ..core.storage import StorageManager
 from .action_executor import ActionExecutor
+from ..arm_sdk import RobotController
 
 logger = logging.getLogger(__name__)
 
@@ -1124,7 +1125,6 @@ class RobotWebSocketServer:
         def _do_init():
             try:
                 self._broadcast_threadsafe({"event": "log", "message": "正在初始化机械臂..."})
-
                 self._robot_controller = RobotController()
 
                 # 初始化 Robot1

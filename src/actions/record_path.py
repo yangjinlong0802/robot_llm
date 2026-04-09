@@ -1,6 +1,6 @@
-from ..arm_sdk.rm_robot_interface import *
 import os
 import time
+from Robotic_Arm.rm_robot_interface import *
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 

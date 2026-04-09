@@ -4,8 +4,8 @@ Robot1 movej 移动到指定点位
 """
 import os
 import time
+from Robotic_Arm.rm_robot_interface import *
 
-from ..arm_sdk.rm_robot_interface import *
 from ..arm_sdk.config import ROBOT1_CONFIG, MOVE_CONFIG
 
 

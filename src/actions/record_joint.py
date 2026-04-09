@@ -9,8 +9,7 @@ import os
 import sys
 import time
 from datetime import datetime
-
-from ..arm_sdk.rm_robot_interface import *
+from Robotic_Arm.rm_robot_interface import *
 from ..arm_sdk.config import ROBOT1_CONFIG, ROBOT2_CONFIG
 
 
