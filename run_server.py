@@ -106,7 +106,7 @@ def main():
     robot_controller, body_controller = init_hardware(args.simulation)
 
     # 启动 WebSocket 服务
-    from src.ws_server import RobotWebSocketServer
+    from src.websocket import RobotWebSocketServer
 
     server = RobotWebSocketServer(
         robot_controller=robot_controller,
