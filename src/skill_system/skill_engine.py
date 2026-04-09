@@ -6,7 +6,7 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from uuid import uuid4
 
-from ..models import SequenceItem, SequenceItemStatus, ActionDefinition, ActionType
+from ..core.models import SequenceItem, SequenceItemStatus, ActionDefinition, ActionType
 from .models import Skill, SkillMatchResult, ValidationResult
 from .skill_registry import SkillRegistry
 
@@ -52,7 +52,7 @@ class SkillEngine:
             加载的技能数量
         """
         if json_path is None:
-            from ..config_loader import Config
+            from ..core.config_loader import Config
             json_path = str(Config.get_skill_library_path())
 
         count = self._registry.load_from_json(json_path)

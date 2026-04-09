@@ -14,7 +14,7 @@ from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont, QColor, QTextCursor
 
 from ..ai_integration import AIController, ExecutionBridge
-from ..dialogs import ActionPreviewDialog
+from ..gui.dialogs import ActionPreviewDialog
 
 logger = logging.getLogger(__name__)
 

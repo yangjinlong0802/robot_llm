@@ -17,16 +17,39 @@ class OpenAIClient(LLMClient):
     使用 OpenAI API 进行意图理解和动作规划
     """
 
-    def __init__(self, api_key: str, model: str = "gpt-4o", base_url: str = ""):
+    def __init__(self, api_key=None, model=None, base_url=None):
         """
         初始化 OpenAI 兼容客户端
 
         Args:
-            api_key: API Key
-            model: 模型名称，默认为 gpt-4o
-            base_url: 自定义 API 地址，留空使用 OpenAI 官方地址。
-                      阿里云百炼: https://dashscope.aliyuncs.com/compatible-mode/v1
+            api_key: API Key，默认从 config.env 读取
+            model: 模型名称，默认从 config.env 读取
+            base_url: 自定义 API 地址，默认从 config.env 读取
         """
+        # 从配置加载器读取默认值
+        try:
+            from ..core.config_loader import Config
+            config = Config.get_instance()
+            if config is not None:
+                if api_key is None:
+                    api_key = config.OPENAI_API_KEY
+                if model is None:
+                    model = config.OPENAI_MODEL
+                if base_url is None:
+                    base_url = config.OPENAI_BASE_URL
+            else:
+                print("警告：Config 实例为 None，使用默认配置")
+        except Exception as e:
+            print(f"加载 LLM 配置失败：{e}，使用传入参数或默认值")
+        
+        # 确保有默认值
+        if api_key is None:
+            api_key = ""
+        if model is None:
+            model = "gpt-4o"
+        if base_url is None:
+            base_url = ""
+        
         self._api_key = api_key
         self._model = model
         self._client = None

@@ -1,4 +1,4 @@
-from ..widget_components import (
+from .widget_components import (
     ActionListWidget,
     SequenceListWidget,
     ControlPanel,

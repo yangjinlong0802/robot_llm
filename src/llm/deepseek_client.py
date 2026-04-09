@@ -21,16 +21,39 @@ class DeepSeekClient(LLMClient):
 
     DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 
-    def __init__(self, api_key: str, model: str = "deepseek-reasoner", base_url: str = ""):
+    def __init__(self, api_key=None, model=None, base_url=None):
         """
         初始化 DeepSeek 客户端
 
         Args:
-            api_key: DeepSeek API Key
-            model: 模型名称，默认为 deepseek-reasoner (R1)
-                  其他可选: deepseek-chat (V3)
-            base_url: 自定义 API 地址，留空使用 DeepSeek 官方地址
+            api_key: DeepSeek API Key，默认从 config.env 读取
+            model: 模型名称，默认从 config.env 读取
+            base_url: 自定义 API 地址，默认从 config.env 读取
         """
+        # 从配置加载器读取默认值
+        try:
+            from ..core.config_loader import Config
+            config = Config.get_instance()
+            if config is not None:
+                if api_key is None:
+                    api_key = config.OPENAI_API_KEY
+                if model is None:
+                    model = config.OPENAI_MODEL
+                if base_url is None:
+                    base_url = config.OPENAI_BASE_URL or self.DEFAULT_BASE_URL
+            else:
+                print("警告：Config 实例为 None，使用默认配置")
+        except Exception as e:
+            print(f"加载 LLM 配置失败：{e}，使用传入参数或默认值")
+        
+        # 确保有默认值
+        if api_key is None:
+            api_key = ""
+        if model is None:
+            model = "deepseek-reasoner"
+        if base_url is None:
+            base_url = self.DEFAULT_BASE_URL
+        
         self._api_key = api_key
         self._model = model
         self._client = None

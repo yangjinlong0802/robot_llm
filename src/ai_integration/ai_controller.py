@@ -8,12 +8,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer
 
-from ..config_loader import Config
+from ..core.config_loader import Config
 from ..llm import OpenAIClient, DeepSeekClient
 from ..llm.base import LLMPlanResult
 from ..skill_system import SkillEngine
 from ..skill_system.models import SkillMatchResult, Skill
-from ..models import SequenceItem
+from ..core.models import SequenceItem
 from .execution_bridge import ExecutionBridge
 
 logger = logging.getLogger(__name__)

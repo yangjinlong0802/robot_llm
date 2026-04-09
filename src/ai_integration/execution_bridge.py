@@ -7,7 +7,7 @@ from typing import List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from ..models import SequenceItem, SequenceItemStatus
+from ..core.models import SequenceItem, SequenceItemStatus
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ class ExecutionBridge(QObject):
             body_controller = getattr(self._main_window, 'body_controller', None)
 
             # 导入 ExecutionThread
-            from ..execution import ExecutionThread
+            from ..gui.execution import ExecutionThread
 
             # 创建执行线程
             self._execution_thread = ExecutionThread(
