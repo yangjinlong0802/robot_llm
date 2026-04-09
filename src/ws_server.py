@@ -1,0 +1,1273 @@
+"""
+WebSocket 服务端
+作为独立服务运行，接受前端 WebSocket 连接，调用机器人控制函数。
+功能与 GUI 模式完全对等。
+
+协议说明:
+    前端 → 服务端（指令）:
+
+    === 执行控制 ===
+        {"action": "execute",       "sequence": [...]}     执行动作序列
+        {"action": "execute_task",  "name": "xxx.task"}    加载并执行已保存的任务
+        {"action": "stop"}                                 停止当前执行
+        {"action": "pause"}                                暂停执行
+        {"action": "resume"}                               恢复执行
+
+    === 动作库管理 ===
+        {"action": "list_actions"}                         获取动作库（按类型分组）
+        {"action": "create_action", "name": "...", "type": "MOVE_TO_POINT", "parameters": {...}}
+        {"action": "delete_action", "id": "..."}           删除动作
+        {"action": "update_action", "id": "...", "name": "...", "type": "...", "parameters": {...}}
+
+    === 序列编排 ===
+        {"action": "get_sequence"}                         获取当前编排的序列
+        {"action": "add_to_sequence",    "items": [...]}   添加动作到序列
+        {"action": "remove_from_sequence", "index": 0}     删除序列中的某项
+        {"action": "move_in_sequence",   "from": 0, "to": 1}  移动序列项位置
+        {"action": "clear_sequence"}                       清空序列
+
+    === 任务持久化 ===
+        {"action": "list_tasks"}                           获取已保存的任务列表
+        {"action": "save_task",     "name": "xxx.task"}    保存当前序列为任务文件
+        {"action": "load_task",     "name": "xxx.task"}    加载任务到当前序列（不执行）
+        {"action": "delete_task",   "name": "xxx.task"}    删除任务文件
+
+    === AI 助手 ===
+        {"action": "ai_chat",      "text": "帮我抓一个瓶子"}  AI 自然语言规划
+        {"action": "ai_confirm"}                            确认执行 AI 规划的序列
+        {"action": "ai_cancel"}                             取消 AI 规划
+        {"action": "ai_status"}                             查询 AI/LLM 状态
+        {"action": "list_skills"}                           获取可用技能列表
+
+    === 设备管理 ===
+        {"action": "status"}                               查询设备/执行状态
+        {"action": "init_robots"}                          初始化机械臂
+        {"action": "init_body"}                            初始化身体（升降平台）
+        {"action": "disconnect"}                           断开所有硬件连接
+        {"action": "test_camera"}                          测试 RealSense 相机
+
+    服务端 → 前端（事件推送）:
+        {"event": "step_started",       "index": 0, "name": "...", "status": "RUNNING"}
+        {"event": "step_completed",     "index": 0, "name": "..."}
+        {"event": "step_failed",        "index": 0, "name": "...", "error": "..."}
+        {"event": "log",                "message": "..."}
+        {"event": "execution_finished"}
+        {"event": "error",              "message": "..."}
+        {"event": "ai_status_changed",  "status": "分析中..."}
+        {"event": "ai_skill_matched",   "skill_id": "...", "skill_name": "...", "params": {...}}
+        {"event": "ai_preview_ready",   "sequence": [...], "skill_info": {...}}
+        {"event": "ai_execution_finished", "success": true, "message": "..."}
+
+启动方式:
+    python run_server.py
+"""
+
+import asyncio
+import json
+import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Optional, Set, List, Dict, Any
+from uuid import uuid4
+
+try:
+    import websockets
+except ImportError:
+    websockets = None
+
+from .models import ActionDefinition, ActionType, SequenceItem, SequenceItemStatus
+from .storage import StorageManager
+from .action_executor import ActionExecutor
+
+logger = logging.getLogger(__name__)
+
+
+class RobotWebSocketServer:
+    """
+    机器人 WebSocket 服务端
+
+    接受前端连接，提供与 GUI 完全对等的功能：
+    - 动作库 CRUD
+    - 序列编排
+    - 任务持久化
+    - 执行控制
+    - AI 自然语言规划
+    - 设备管理
+    """
+
+    def __init__(
+        self,
+        robot_controller=None,
+        body_controller=None,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+    ):
+        if websockets is None:
+            raise ImportError(
+                "websockets 库未安装，请运行: pip install websockets"
+            )
+
+        self._robot_controller = robot_controller
+        self._body_controller = body_controller
+        self._host = host
+        self._port = port
+
+        # 已连接的客户端集合
+        self._clients: Set = set()
+
+        # 执行器（延迟创建，回调绑定广播函数）
+        self._executor: Optional[ActionExecutor] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # 当前编排的序列（对应 GUI 右侧的序列列表）
+        self._current_sequence: List[SequenceItem] = []
+
+        # AI 相关状态
+        self._ai_preview_sequence: List[SequenceItem] = []
+        self._ai_preview_skill_info: Dict[str, Any] = {}
+        self._ai_processing = False
+        self._ai_thread_pool = ThreadPoolExecutor(max_workers=1)
+
+        # LLM 客户端和技能引擎（延迟初始化，避免未安装 AI 依赖时报错）
+        self._llm_client = None
+        self._skill_engine = None
+
+        # 设备连接状态
+        self._device_status = {
+            "robot1": False,
+            "robot2": False,
+            "body": body_controller is not None,
+        }
+        # 检测机械臂连接状态
+        if robot_controller is not None:
+            self._device_status["robot1"] = True
+            self._device_status["robot2"] = True
+
+    # ------------------------------------------------------------------
+    # 启动服务
+    # ------------------------------------------------------------------
+
+    def run(self) -> None:
+        """阻塞运行 WebSocket 服务（主线程调用）"""
+        asyncio.run(self._serve())
+
+    async def _serve(self) -> None:
+        """异步启动 WebSocket 服务"""
+        self._loop = asyncio.get_running_loop()
+
+        # 创建执行器
+        self._executor = ActionExecutor(
+            robot_controller=self._robot_controller,
+            body_controller=self._body_controller,
+            on_step_started=self._on_step_started,
+            on_step_completed=self._on_step_completed,
+            on_step_failed=self._on_step_failed,
+            on_log=self._on_log,
+            on_finished=self._on_finished,
+        )
+
+        # 初始化 AI 组件
+        self._init_ai()
+
+        async with websockets.serve(self._handler, self._host, self._port):
+            logger.info("WebSocket 服务已启动: ws://%s:%d", self._host, self._port)
+            print(f"WebSocket 服务已启动: ws://{self._host}:{self._port}")
+            print("等待前端连接...")
+            await asyncio.Future()
+
+    # ------------------------------------------------------------------
+    # AI 初始化（不依赖 Qt）
+    # ------------------------------------------------------------------
+
+    def _init_ai(self) -> None:
+        """初始化 LLM 客户端和技能引擎"""
+        try:
+            from .config_loader import Config
+            config = Config.get_instance()
+
+            # 初始化技能引擎
+            from .skill_system import SkillEngine
+            self._skill_engine = SkillEngine()
+            skill_count = self._skill_engine.load_skills()
+            logger.info("技能引擎加载了 %d 个技能", skill_count)
+
+            # 初始化 LLM 客户端
+            if config.OPENAI_API_KEY:
+                provider = config.MODEL_PROVIDER.lower()
+                if provider == "deepseek":
+                    from .llm import DeepSeekClient
+                    self._llm_client = DeepSeekClient(
+                        api_key=config.OPENAI_API_KEY,
+                        model=config.OPENAI_MODEL or "deepseek-reasoner",
+                    )
+                else:
+                    from .llm import OpenAIClient
+                    self._llm_client = OpenAIClient(
+                        api_key=config.OPENAI_API_KEY,
+                        model=config.OPENAI_MODEL or "gpt-4o",
+                    )
+
+                if self._llm_client.is_available():
+                    logger.info("LLM 客户端就绪: %s", self._llm_client.get_model_name())
+                else:
+                    logger.warning("LLM 客户端不可用")
+            else:
+                logger.warning("未配置 API Key，AI 功能不可用")
+
+        except Exception as e:
+            logger.warning("AI 组件初始化失败: %s", e)
+
+    # ------------------------------------------------------------------
+    # 连接处理
+    # ------------------------------------------------------------------
+
+    async def _handler(self, websocket) -> None:
+        """处理单个客户端连接"""
+        self._clients.add(websocket)
+        remote = websocket.remote_address
+        logger.info("客户端已连接: %s", remote)
+        print(f"客户端已连接: {remote}")
+
+        try:
+            async for raw in websocket:
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    await websocket.send(self._json_msg(
+                        {"event": "error", "message": "无效的 JSON 格式"}
+                    ))
+                    continue
+
+                await self._dispatch(websocket, data)
+
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("客户端断开: %s", remote)
+        finally:
+            self._clients.discard(websocket)
+            print(f"客户端断开: {remote}")
+
+    # ------------------------------------------------------------------
+    # 指令分发
+    # ------------------------------------------------------------------
+
+    async def _dispatch(self, websocket, data: dict) -> None:
+        """根据 action 字段分发到对应处理函数"""
+        action = data.get("action", "")
+
+        # 指令路由表
+        handlers = {
+            # 执行控制
+            "execute":       self._handle_execute,
+            "execute_task":  self._handle_execute_task,
+            "stop":          self._handle_stop,
+            "pause":         self._handle_pause,
+            "resume":        self._handle_resume,
+            # 动作库管理
+            "list_actions":  self._handle_list_actions,
+            "create_action": self._handle_create_action,
+            "delete_action": self._handle_delete_action,
+            "update_action": self._handle_update_action,
+            # 序列编排
+            "get_sequence":          self._handle_get_sequence,
+            "add_to_sequence":       self._handle_add_to_sequence,
+            "remove_from_sequence":  self._handle_remove_from_sequence,
+            "move_in_sequence":      self._handle_move_in_sequence,
+            "clear_sequence":        self._handle_clear_sequence,
+            # 任务持久化
+            "list_tasks":    self._handle_list_tasks,
+            "save_task":     self._handle_save_task,
+            "load_task":     self._handle_load_task,
+            "delete_task":   self._handle_delete_task,
+            # AI 助手
+            "ai_chat":       self._handle_ai_chat,
+            "ai_confirm":    self._handle_ai_confirm,
+            "ai_cancel":     self._handle_ai_cancel,
+            "ai_status":     self._handle_ai_status,
+            "list_skills":   self._handle_list_skills,
+            # 设备管理
+            "status":        self._handle_status,
+            "init_robots":   self._handle_init_robots,
+            "init_body":     self._handle_init_body,
+            "disconnect":    self._handle_disconnect,
+            "test_camera":   self._handle_test_camera,
+        }
+
+        handler = handlers.get(action)
+        if handler:
+            await handler(websocket, data)
+        else:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"未知的 action: {action}"}
+            ))
+
+    # ==================================================================
+    # 执行控制
+    # ==================================================================
+
+    async def _handle_execute(self, websocket, data: dict) -> None:
+        """
+        执行动作序列
+        请求: {"action": "execute", "sequence": [...]}
+        如果 sequence 省略，则执行当前编排的序列
+        """
+        if self._executor.is_running:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "已有序列正在执行，请先停止"}
+            ))
+            return
+
+        raw_sequence = data.get("sequence")
+        if raw_sequence:
+            # 前端传入了序列数据
+            try:
+                sequence = self._parse_sequence(raw_sequence)
+            except Exception as e:
+                await websocket.send(self._json_msg(
+                    {"event": "error", "message": f"序列解析失败: {str(e)}"}
+                ))
+                return
+        else:
+            # 执行当前编排的序列
+            sequence = self._current_sequence
+
+        if not sequence:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "序列为空，请先添加动作"}
+            ))
+            return
+
+        # 重置状态
+        for item in sequence:
+            item.status = SequenceItemStatus.PENDING
+
+        await self._broadcast({
+            "event": "accepted",
+            "message": "开始执行",
+            "steps": len(sequence),
+        })
+        self._executor.execute(sequence)
+
+    async def _handle_execute_task(self, websocket, data: dict) -> None:
+        """
+        加载并执行已保存的任务
+        请求: {"action": "execute_task", "name": "xxx.task"}
+        """
+        if self._executor.is_running:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "已有序列正在执行，请先停止"}
+            ))
+            return
+
+        task_name = data.get("name", "")
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "name 不能为空"}
+            ))
+            return
+
+        sequence = StorageManager.load_sequence(task_name)
+        if not sequence:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务 '{task_name}' 不存在或为空"}
+            ))
+            return
+
+        for item in sequence:
+            item.status = SequenceItemStatus.PENDING
+
+        await self._broadcast({
+            "event": "accepted",
+            "message": f"加载任务 '{task_name}'，开始执行",
+            "steps": len(sequence),
+        })
+        self._executor.execute(sequence)
+
+    async def _handle_stop(self, websocket, data: dict) -> None:
+        """停止执行"""
+        if self._executor.is_running:
+            self._executor.stop()
+            await websocket.send(self._json_msg(
+                {"event": "stopped", "message": "已发送停止指令"}
+            ))
+        else:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "当前没有正在执行的序列"}
+            ))
+
+    async def _handle_pause(self, websocket, data: dict) -> None:
+        """暂停执行"""
+        if self._executor.is_running and not self._executor.is_paused:
+            self._executor.pause()
+            await websocket.send(self._json_msg(
+                {"event": "paused", "message": "执行已暂停"}
+            ))
+        else:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "无法暂停：未在执行或已暂停"}
+            ))
+
+    async def _handle_resume(self, websocket, data: dict) -> None:
+        """恢复执行"""
+        if self._executor.is_running and self._executor.is_paused:
+            self._executor.resume()
+            await websocket.send(self._json_msg(
+                {"event": "resumed", "message": "执行已恢复"}
+            ))
+        else:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "无法恢复：未处于暂停状态"}
+            ))
+
+    # ==================================================================
+    # 动作库管理
+    # ==================================================================
+
+    async def _handle_list_actions(self, websocket, data: dict) -> None:
+        """
+        返回动作库（按类型分组）
+        响应: {"event": "actions_list", "actions": {...按类型分组...}}
+        """
+        all_actions = StorageManager.load_actions()
+
+        # 按类型分组（与 GUI 左侧 Tab 对应）
+        grouped = {
+            "MOVE_TO_POINT": [],
+            "ARM_ACTION": [],
+            "INSPECT_AND_OUTPUT": [],
+            "CHANGE_GUN": [],
+            "VISION_CAPTURE": [],
+        }
+        for a in all_actions:
+            type_key = a.type.value
+            if type_key in grouped:
+                grouped[type_key].append(a.to_dict())
+
+        await websocket.send(self._json_msg({
+            "event": "actions_list",
+            "actions": grouped,
+            "total": len(all_actions),
+        }))
+
+    async def _handle_create_action(self, websocket, data: dict) -> None:
+        """
+        新建动作
+        请求: {"action": "create_action", "name": "移动到A点", "type": "MOVE_TO_POINT", "parameters": {...}}
+        """
+        name = data.get("name", "").strip()
+        if not name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "动作名称不能为空"}
+            ))
+            return
+
+        action_type_str = data.get("type", "")
+        try:
+            action_type = ActionType(action_type_str)
+        except ValueError:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"无效的动作类型: {action_type_str}，"
+                 f"可选: {[t.value for t in ActionType]}"}
+            ))
+            return
+
+        parameters = data.get("parameters", {})
+
+        # 创建动作定义
+        action_def = ActionDefinition(
+            id=str(uuid4()),
+            name=name,
+            type=action_type,
+            parameters=parameters,
+        )
+
+        # 保存到持久化
+        all_actions = StorageManager.load_actions()
+        all_actions.append(action_def)
+        StorageManager.save_actions(all_actions)
+
+        await websocket.send(self._json_msg({
+            "event": "action_created",
+            "action": action_def.to_dict(),
+        }))
+        logger.info("新建动作: %s (%s)", name, action_type_str)
+
+    async def _handle_delete_action(self, websocket, data: dict) -> None:
+        """
+        删除动作
+        请求: {"action": "delete_action", "id": "..."}
+        """
+        action_id = data.get("id", "")
+        if not action_id:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "动作 id 不能为空"}
+            ))
+            return
+
+        all_actions = StorageManager.load_actions()
+        original_count = len(all_actions)
+        all_actions = [a for a in all_actions if a.id != action_id]
+
+        if len(all_actions) == original_count:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"未找到 id 为 '{action_id}' 的动作"}
+            ))
+            return
+
+        StorageManager.save_actions(all_actions)
+        await websocket.send(self._json_msg({
+            "event": "action_deleted",
+            "id": action_id,
+        }))
+        logger.info("删除动作: %s", action_id)
+
+    async def _handle_update_action(self, websocket, data: dict) -> None:
+        """
+        更新动作
+        请求: {"action": "update_action", "id": "...", "name": "...", "type": "...", "parameters": {...}}
+        """
+        action_id = data.get("id", "")
+        if not action_id:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "动作 id 不能为空"}
+            ))
+            return
+
+        all_actions = StorageManager.load_actions()
+        target = None
+        for a in all_actions:
+            if a.id == action_id:
+                target = a
+                break
+
+        if target is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"未找到 id 为 '{action_id}' 的动作"}
+            ))
+            return
+
+        # 更新字段（只更新提供的字段）
+        if "name" in data:
+            target.name = data["name"]
+        if "type" in data:
+            try:
+                target.type = ActionType(data["type"])
+            except ValueError:
+                await websocket.send(self._json_msg(
+                    {"event": "error", "message": f"无效的动作类型: {data['type']}"}
+                ))
+                return
+        if "parameters" in data:
+            target.parameters = data["parameters"]
+
+        StorageManager.save_actions(all_actions)
+        await websocket.send(self._json_msg({
+            "event": "action_updated",
+            "action": target.to_dict(),
+        }))
+        logger.info("更新动作: %s", action_id)
+
+    # ==================================================================
+    # 序列编排（对应 GUI 右侧序列列表）
+    # ==================================================================
+
+    async def _handle_get_sequence(self, websocket, data: dict) -> None:
+        """获取当前编排的序列"""
+        await websocket.send(self._json_msg({
+            "event": "sequence",
+            "sequence": [item.to_dict() for item in self._current_sequence],
+        }))
+
+    async def _handle_add_to_sequence(self, websocket, data: dict) -> None:
+        """
+        添加动作到序列
+        请求: {"action": "add_to_sequence", "items": [
+            {"name": "...", "type": "MOVE_TO_POINT", "parameters": {...}},
+            ...
+        ]}
+        也支持传入动作库中的 id: {"action": "add_to_sequence", "action_ids": ["id1", "id2"]}
+        """
+        # 方式1: 通过 action_ids 从动作库引用
+        action_ids = data.get("action_ids", [])
+        if action_ids:
+            all_actions = StorageManager.load_actions()
+            action_map = {a.id: a for a in all_actions}
+            for aid in action_ids:
+                if aid in action_map:
+                    seq_item = SequenceItem.from_definition(action_map[aid])
+                    self._current_sequence.append(seq_item)
+                else:
+                    await websocket.send(self._json_msg(
+                        {"event": "error", "message": f"动作库中不存在 id: {aid}"}
+                    ))
+                    return
+
+        # 方式2: 直接传入动作数据
+        items = data.get("items", [])
+        if items:
+            parsed = self._parse_sequence(items)
+            self._current_sequence.extend(parsed)
+
+        if not action_ids and not items:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "请提供 items 或 action_ids"}
+            ))
+            return
+
+        await websocket.send(self._json_msg({
+            "event": "sequence_updated",
+            "sequence": [item.to_dict() for item in self._current_sequence],
+        }))
+
+    async def _handle_remove_from_sequence(self, websocket, data: dict) -> None:
+        """
+        删除序列中的某项
+        请求: {"action": "remove_from_sequence", "index": 0}
+        """
+        index = data.get("index")
+        if index is None or not (0 <= index < len(self._current_sequence)):
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"无效的索引: {index}，序列长度: {len(self._current_sequence)}"}
+            ))
+            return
+
+        removed = self._current_sequence.pop(index)
+        await websocket.send(self._json_msg({
+            "event": "sequence_updated",
+            "removed": removed.to_dict(),
+            "sequence": [item.to_dict() for item in self._current_sequence],
+        }))
+
+    async def _handle_move_in_sequence(self, websocket, data: dict) -> None:
+        """
+        移动序列项位置
+        请求: {"action": "move_in_sequence", "from": 0, "to": 1}
+        """
+        from_idx = data.get("from")
+        to_idx = data.get("to")
+        seq_len = len(self._current_sequence)
+
+        if from_idx is None or to_idx is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "需要提供 from 和 to 索引"}
+            ))
+            return
+
+        if not (0 <= from_idx < seq_len) or not (0 <= to_idx < seq_len):
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"索引越界，序列长度: {seq_len}"}
+            ))
+            return
+
+        item = self._current_sequence.pop(from_idx)
+        self._current_sequence.insert(to_idx, item)
+
+        await websocket.send(self._json_msg({
+            "event": "sequence_updated",
+            "sequence": [item.to_dict() for item in self._current_sequence],
+        }))
+
+    async def _handle_clear_sequence(self, websocket, data: dict) -> None:
+        """清空序列"""
+        self._current_sequence.clear()
+        await websocket.send(self._json_msg({
+            "event": "sequence_updated",
+            "sequence": [],
+        }))
+
+    # ==================================================================
+    # 任务持久化
+    # ==================================================================
+
+    async def _handle_list_tasks(self, websocket, data: dict) -> None:
+        """返回所有已保存的任务文件名"""
+        tasks = StorageManager.list_tasks()
+        await websocket.send(self._json_msg({
+            "event": "tasks_list",
+            "tasks": tasks,
+        }))
+
+    async def _handle_save_task(self, websocket, data: dict) -> None:
+        """
+        保存当前序列为任务文件
+        请求: {"action": "save_task", "name": "xxx.task"}
+        """
+        task_name = data.get("name", "").strip()
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        if not self._current_sequence:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "序列为空，无需保存"}
+            ))
+            return
+
+        StorageManager.save_sequence(self._current_sequence, task_name)
+        await websocket.send(self._json_msg({
+            "event": "task_saved",
+            "name": task_name,
+            "steps": len(self._current_sequence),
+        }))
+        logger.info("任务已保存: %s", task_name)
+
+    async def _handle_load_task(self, websocket, data: dict) -> None:
+        """
+        加载任务到当前序列（不执行）
+        请求: {"action": "load_task", "name": "xxx.task"}
+        """
+        task_name = data.get("name", "").strip()
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        sequence = StorageManager.load_sequence(task_name)
+        if not sequence:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务 '{task_name}' 不存在或为空"}
+            ))
+            return
+
+        # 加载到当前序列（替换）
+        self._current_sequence = sequence
+        for item in self._current_sequence:
+            item.status = SequenceItemStatus.PENDING
+
+        await websocket.send(self._json_msg({
+            "event": "task_loaded",
+            "name": task_name,
+            "sequence": [item.to_dict() for item in self._current_sequence],
+        }))
+        logger.info("任务已加载: %s", task_name)
+
+    async def _handle_delete_task(self, websocket, data: dict) -> None:
+        """
+        删除任务文件
+        请求: {"action": "delete_task", "name": "xxx.task"}
+        """
+        task_name = data.get("name", "").strip()
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        # 构建文件路径
+        name = Path(task_name).name
+        filepath = StorageManager.TASKS_DIR / name
+        if filepath.suffix != ".task":
+            filepath = filepath.with_suffix(".task")
+
+        if not filepath.is_file():
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务文件 '{task_name}' 不存在"}
+            ))
+            return
+
+        filepath.unlink()
+        await websocket.send(self._json_msg({
+            "event": "task_deleted",
+            "name": task_name,
+        }))
+        logger.info("任务已删除: %s", task_name)
+
+    # ==================================================================
+    # AI 助手
+    # ==================================================================
+
+    async def _handle_ai_chat(self, websocket, data: dict) -> None:
+        """
+        AI 自然语言规划
+        请求: {"action": "ai_chat", "text": "帮我抓一个瓶子"}
+        流程: text → LLM → SkillEngine → 预览序列推送到前端
+        """
+        text = data.get("text", "").strip()
+        if not text:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "text 不能为空"}
+            ))
+            return
+
+        if self._ai_processing:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "正在处理上一次请求，请稍候"}
+            ))
+            return
+
+        if self._llm_client is None or not self._llm_client.is_available():
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "LLM 不可用，请检查 config.env 中的 API Key 配置"}
+            ))
+            return
+
+        if self._skill_engine is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "技能引擎未初始化"}
+            ))
+            return
+
+        self._ai_processing = True
+        self._broadcast_threadsafe({"event": "ai_status_changed", "status": "分析中..."})
+
+        # 在后台线程执行 LLM 调用（避免阻塞 asyncio 事件循环）
+        def _do_ai_work():
+            try:
+                from .skill_system.models import SkillMatchResult
+
+                # 1. 调用 LLM 进行意图理解
+                skill_summaries = self._skill_engine.list_all_skills()
+                llm_result = self._llm_client.plan(text, skill_summaries)
+
+                if not llm_result.is_valid():
+                    error_msg = llm_result.error or f"无法理解您的意图（置信度: {llm_result.confidence:.0%}）"
+                    self._broadcast_threadsafe({
+                        "event": "ai_skill_not_matched",
+                        "error": error_msg,
+                    })
+                    self._broadcast_threadsafe({"event": "ai_status_changed", "status": "匹配失败"})
+                    return
+
+                # 2. 技能匹配成功
+                skill_match = SkillMatchResult(
+                    skill_id=llm_result.skill_id,
+                    skill_name=llm_result.skill_name,
+                    confidence=llm_result.confidence,
+                    extracted_params=llm_result.parameters,
+                    reasoning=llm_result.reasoning,
+                )
+
+                self._broadcast_threadsafe({
+                    "event": "ai_skill_matched",
+                    "skill_id": llm_result.skill_id,
+                    "skill_name": llm_result.skill_name,
+                    "confidence": llm_result.confidence,
+                    "params": llm_result.parameters,
+                    "reasoning": llm_result.reasoning,
+                })
+
+                # 3. 展开技能为动作序列
+                skill_info = self._skill_engine.get_skill_info(llm_result.skill_id)
+                if skill_info is None:
+                    self._broadcast_threadsafe({
+                        "event": "error",
+                        "message": f"技能 {llm_result.skill_id} 不存在",
+                    })
+                    return
+
+                sequence, validation = self._skill_engine.parse_and_expand(skill_match)
+
+                if not validation.is_valid:
+                    self._broadcast_threadsafe({
+                        "event": "error",
+                        "message": validation.message,
+                    })
+                    return
+
+                # 4. 保存预览数据，推送给前端
+                self._ai_preview_sequence = sequence
+                self._ai_preview_skill_info = skill_info
+
+                self._broadcast_threadsafe({
+                    "event": "ai_preview_ready",
+                    "sequence": [item.to_dict() for item in sequence],
+                    "skill_info": skill_info,
+                })
+                self._broadcast_threadsafe({"event": "ai_status_changed", "status": "预览就绪"})
+
+                logger.info("AI 规划完成: %s → %d 个动作", llm_result.skill_name, len(sequence))
+
+            except Exception as e:
+                logger.error("AI 处理失败: %s", e, exc_info=True)
+                self._broadcast_threadsafe({
+                    "event": "error",
+                    "message": f"AI 处理失败: {str(e)}",
+                })
+            finally:
+                self._ai_processing = False
+
+        self._ai_thread_pool.submit(_do_ai_work)
+
+    async def _handle_ai_confirm(self, websocket, data: dict) -> None:
+        """
+        确认执行 AI 规划的序列
+        请求: {"action": "ai_confirm"}
+        """
+        if not self._ai_preview_sequence:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "没有待确认的 AI 规划序列"}
+            ))
+            return
+
+        if self._executor.is_running:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "已有序列正在执行，请先停止"}
+            ))
+            return
+
+        sequence = self._ai_preview_sequence
+        for item in sequence:
+            item.status = SequenceItemStatus.PENDING
+
+        # 同步到当前序列
+        self._current_sequence = list(sequence)
+
+        await self._broadcast({
+            "event": "accepted",
+            "message": "AI 序列开始执行",
+            "steps": len(sequence),
+        })
+        self._executor.execute(sequence)
+
+        # 清空预览状态
+        self._ai_preview_sequence = []
+        self._ai_preview_skill_info = {}
+
+    async def _handle_ai_cancel(self, websocket, data: dict) -> None:
+        """取消 AI 规划"""
+        self._ai_preview_sequence = []
+        self._ai_preview_skill_info = {}
+        await websocket.send(self._json_msg({
+            "event": "ai_cancelled",
+            "message": "AI 规划已取消",
+        }))
+
+    async def _handle_ai_status(self, websocket, data: dict) -> None:
+        """查询 AI/LLM 状态"""
+        llm_available = self._llm_client is not None and self._llm_client.is_available()
+        model_name = self._llm_client.get_model_name() if self._llm_client else "未配置"
+
+        try:
+            from .config_loader import Config
+            config = Config.get_instance()
+            provider = config.MODEL_PROVIDER.upper()
+            api_key_set = bool(config.OPENAI_API_KEY)
+        except Exception:
+            provider = "未知"
+            api_key_set = False
+
+        await websocket.send(self._json_msg({
+            "event": "ai_status",
+            "llm_available": llm_available,
+            "api_key_set": api_key_set,
+            "model": model_name,
+            "provider": provider,
+            "processing": self._ai_processing,
+            "has_preview": bool(self._ai_preview_sequence),
+        }))
+
+    async def _handle_list_skills(self, websocket, data: dict) -> None:
+        """获取可用技能列表"""
+        if self._skill_engine is None:
+            await websocket.send(self._json_msg({
+                "event": "skills_list",
+                "skills": [],
+            }))
+            return
+
+        skills = self._skill_engine.list_all_skills()
+        await websocket.send(self._json_msg({
+            "event": "skills_list",
+            "skills": skills,
+        }))
+
+    # ==================================================================
+    # 设备管理
+    # ==================================================================
+
+    async def _handle_status(self, websocket, data: dict) -> None:
+        """查询设备和执行状态"""
+        await websocket.send(self._json_msg({
+            "event": "status",
+            "devices": self._device_status,
+            "executor": {
+                "running": self._executor.is_running,
+                "paused": self._executor.is_paused,
+            },
+            "sequence_length": len(self._current_sequence),
+            "ai_processing": self._ai_processing,
+        }))
+
+    async def _handle_init_robots(self, websocket, data: dict) -> None:
+        """
+        初始化机械臂
+        请求: {"action": "init_robots"}
+        """
+        def _do_init():
+            try:
+                from Robot import RobotController
+                self._broadcast_threadsafe({"event": "log", "message": "正在初始化机械臂..."})
+
+                self._robot_controller = RobotController()
+
+                # 初始化 Robot1
+                robot1 = self._robot_controller.init_robot1()
+                if robot1 is not None:
+                    self._device_status["robot1"] = True
+                    self._broadcast_threadsafe({"event": "log", "message": "Robot1 初始化成功"})
+                else:
+                    self._broadcast_threadsafe({"event": "log", "message": "Robot1 初始化失败"})
+
+                # 初始化 Robot2
+                robot2 = self._robot_controller.init_robot2()
+                if robot2 is not None:
+                    self._device_status["robot2"] = True
+                    self._broadcast_threadsafe({"event": "log", "message": "Robot2 初始化成功"})
+                else:
+                    self._broadcast_threadsafe({"event": "log", "message": "Robot2 初始化失败"})
+
+                # 更新执行器的控制器引用
+                self._executor._robot_controller = self._robot_controller
+
+                self._broadcast_threadsafe({
+                    "event": "device_status_changed",
+                    "devices": self._device_status,
+                })
+
+            except ImportError as e:
+                self._broadcast_threadsafe({"event": "error", "message": f"机械臂模块导入失败: {e}"})
+            except Exception as e:
+                self._broadcast_threadsafe({"event": "error", "message": f"机械臂初始化异常: {e}"})
+
+        threading.Thread(target=_do_init, daemon=True, name="InitRobots").start()
+        await websocket.send(self._json_msg({"event": "log", "message": "开始初始化机械臂..."}))
+
+    async def _handle_init_body(self, websocket, data: dict) -> None:
+        """
+        初始化身体（升降平台）
+        请求: {"action": "init_body"}
+        """
+        try:
+            from gui import ModbusMotor
+            self._body_controller = ModbusMotor(
+                port="/dev/body", baudrate=115200, slave_id=1, timeout=1
+            )
+            self._device_status["body"] = True
+            self._executor._body_controller = self._body_controller
+
+            await websocket.send(self._json_msg({
+                "event": "log",
+                "message": "身体控制器初始化成功",
+            }))
+            await websocket.send(self._json_msg({
+                "event": "device_status_changed",
+                "devices": self._device_status,
+            }))
+        except ImportError as e:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"身体模块导入失败: {e}"}
+            ))
+        except Exception as e:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"身体初始化异常: {e}"}
+            ))
+
+    async def _handle_disconnect(self, websocket, data: dict) -> None:
+        """断开所有硬件连接"""
+        messages = []
+
+        if self._executor.is_running:
+            self._executor.stop()
+            messages.append("已停止当前执行")
+
+        if self._robot_controller is not None:
+            try:
+                self._robot_controller.shutdown()
+                messages.append("机械臂已断开")
+            except Exception as e:
+                messages.append(f"断开机械臂出错: {e}")
+            self._robot_controller = None
+            self._executor._robot_controller = None
+            self._device_status["robot1"] = False
+            self._device_status["robot2"] = False
+
+        if self._body_controller is not None:
+            try:
+                self._body_controller.close()
+                messages.append("身体控制器已断开")
+            except Exception as e:
+                messages.append(f"断开身体控制器出错: {e}")
+            self._body_controller = None
+            self._executor._body_controller = None
+            self._device_status["body"] = False
+
+        await websocket.send(self._json_msg({
+            "event": "disconnected",
+            "messages": messages,
+            "devices": self._device_status,
+        }))
+
+    async def _handle_test_camera(self, websocket, data: dict) -> None:
+        """
+        测试 RealSense 相机
+        请求: {"action": "test_camera"}
+        """
+        def _do_test():
+            try:
+                import pyrealsense2 as rs
+                from .config_loader import Config
+                import time
+
+                sn = Config.get_instance().REALSENSE_DEVICE_SN
+
+                ctx = rs.context()
+                devices = list(ctx.devices)
+                if not devices:
+                    self._broadcast_threadsafe({
+                        "event": "camera_test_result",
+                        "success": False,
+                        "message": "未检测到 RealSense 设备",
+                    })
+                    return
+
+                pipeline = rs.pipeline()
+                cfg = rs.config()
+                cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+                cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+                if sn:
+                    cfg.enable_device(sn)
+                pipeline.start(cfg)
+
+                time.sleep(1)
+
+                import time as _time
+                deadline = _time.time() + 10
+                while _time.time() < deadline:
+                    try:
+                        frames = pipeline.wait_for_frames(200)
+                        color = frames.get_color_frame()
+                        depth = frames.get_depth_frame()
+                        if color and depth:
+                            msg = (f"相机测试成功: color={color.width}x{color.height}  "
+                                   f"depth={depth.get_distance(320, 240):.3f}m  "
+                                   f"(SN={sn or 'auto-select'})")
+                            pipeline.stop()
+                            self._broadcast_threadsafe({
+                                "event": "camera_test_result",
+                                "success": True,
+                                "message": msg,
+                            })
+                            return
+                    except Exception:
+                        pass
+
+                pipeline.stop()
+                self._broadcast_threadsafe({
+                    "event": "camera_test_result",
+                    "success": False,
+                    "message": "取帧超时（10 秒内未获得有效帧）",
+                })
+
+            except Exception as e:
+                self._broadcast_threadsafe({
+                    "event": "camera_test_result",
+                    "success": False,
+                    "message": str(e),
+                })
+
+        threading.Thread(target=_do_test, daemon=True, name="TestCamera").start()
+        await websocket.send(self._json_msg({"event": "log", "message": "正在测试相机..."}))
+
+    # ==================================================================
+    # 序列解析
+    # ==================================================================
+
+    def _parse_sequence(self, raw: list) -> list:
+        """
+        将前端传来的 JSON 数组转换为 SequenceItem 列表
+
+        支持两种格式:
+        1. 完整格式（含 uuid）: {"uuid": "...", "definition": {...}, "status": "PENDING"}
+        2. 简化格式:           {"name": "移动到A点", "type": "MOVE_TO_POINT", "parameters": {...}}
+        """
+        sequence = []
+        for item_data in raw:
+            if "definition" in item_data:
+                seq_item = SequenceItem.from_dict(item_data)
+            else:
+                action_def = ActionDefinition.from_dict({
+                    "id": item_data.get("id", ""),
+                    "name": item_data.get("name", "未命名动作"),
+                    "type": item_data.get("type", ""),
+                    "parameters": item_data.get("parameters", {}),
+                })
+                seq_item = SequenceItem.from_definition(action_def)
+
+            seq_item.status = SequenceItemStatus.PENDING
+            sequence.append(seq_item)
+
+        return sequence
+
+    # ==================================================================
+    # 执行器回调 → 广播到所有客户端
+    # ==================================================================
+
+    def _on_step_started(self, index: int, item: SequenceItem) -> None:
+        self._broadcast_threadsafe({
+            "event": "step_started",
+            "index": index,
+            "name": item.definition.name,
+            "status": item.status.value,
+        })
+
+    def _on_step_completed(self, index: int, item: SequenceItem) -> None:
+        self._broadcast_threadsafe({
+            "event": "step_completed",
+            "index": index,
+            "name": item.definition.name,
+        })
+
+    def _on_step_failed(self, index: int, item: SequenceItem, error: str) -> None:
+        self._broadcast_threadsafe({
+            "event": "step_failed",
+            "index": index,
+            "name": item.definition.name,
+            "error": error,
+        })
+
+    def _on_log(self, message: str) -> None:
+        logger.info(message)
+        self._broadcast_threadsafe({
+            "event": "log",
+            "message": message,
+        })
+
+    def _on_finished(self) -> None:
+        self._broadcast_threadsafe({
+            "event": "execution_finished",
+        })
+
+    # ==================================================================
+    # 广播工具
+    # ==================================================================
+
+    def _broadcast_threadsafe(self, data: dict) -> None:
+        """从任意线程安全地广播消息到所有客户端"""
+        if self._loop is None:
+            return
+        self._loop.call_soon_threadsafe(
+            asyncio.ensure_future,
+            self._broadcast(data),
+        )
+
+    async def _broadcast(self, data: dict) -> None:
+        """广播消息到所有已连接的客户端"""
+        if not self._clients:
+            return
+        msg = self._json_msg(data)
+        disconnected = []
+        for client in list(self._clients):
+            try:
+                await client.send(msg)
+            except Exception:
+                disconnected.append(client)
+        for client in disconnected:
+            self._clients.discard(client)
+
+    @staticmethod
+    def _json_msg(data: dict) -> str:
+        return json.dumps(data, ensure_ascii=False)
