@@ -41,11 +41,26 @@ WebSocket 服务端
         {"action": "list_skills"}                           获取可用技能列表
 
     === 设备管理 ===
-        {"action": "status"}                               查询设备/执行状态
+        {"action": "status"}                               查询设备/执行状态（含相机状态）
         {"action": "init_robots"}                          初始化机械臂
         {"action": "init_body"}                            初始化身体（升降平台）
         {"action": "disconnect"}                           断开所有硬件连接
-        {"action": "test_camera"}                          测试 RealSense 相机
+        {"action": "test_camera"}                          测试 RealSense 相机（单次）
+
+    === 相机流媒体 ===
+        {"action": "camera_status"}                        查询相机管理器状态
+
+    === MiniCPM 聊天代理 ===
+        {"action": "minicpm_status"}                       查询 MiniCPM 网关配置与代理状态
+
+WebSocket 路径:
+    ws://{host}:{port}/               — 前端主控连接（本协议）
+    ws://{host}:{port}/camera/stream  — 拼接 JPEG 流（二进制帧，30fps）
+    ws://{host}:{port}/camera/frames  — 每路相机独立帧
+                                        {"frames": [{"camera_id":"...", "index":0, "data":"<base64>"}]}
+    ws://{host}:{port}/ws/chat        — 透明代理到 MiniCPM 网关（聊天模式，注入系统提示 + 指令检测）
+    ws://{host}:{port}/ws/duplex/*    — 透明代理到 MiniCPM 网关（全双工音视频模式）
+    ws://{host}:{port}/ws/half_duplex/* — 透明代理到 MiniCPM 网关（半双工音频模式）
 
     服务端 → 前端（事件推送）:
         {"event": "step_started",       "index": 0, "name": "...", "status": "RUNNING"}
@@ -58,12 +73,14 @@ WebSocket 服务端
         {"event": "ai_skill_matched",   "skill_id": "...", "skill_name": "...", "params": {...}}
         {"event": "ai_preview_ready",   "sequence": [...], "skill_info": {...}}
         {"event": "ai_execution_finished", "success": true, "message": "..."}
+        {"event": "minicpm_instruction", "instruction": "..."}  MiniCPM 检测到机器人指令时推送
 
 启动方式:
     python run_server.py
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -81,6 +98,10 @@ except ImportError:
 from ..core.models import ActionDefinition, ActionType, SequenceItem, SequenceItemStatus
 from ..core.storage import StorageManager
 from .action_executor import ActionExecutor
+from .camera_manager import RealSenseManager
+from .minicpm_proxy import MiniCPMProxyConfig, _extract_user_text
+from .interceptor import OutgoingInjector
+from .ask_service import classify_instruction
 from ..arm_sdk import RobotController
 
 logger = logging.getLogger(__name__)
@@ -147,6 +168,19 @@ class RobotWebSocketServer:
             self._device_status["robot1"] = True
             self._device_status["robot2"] = True
 
+        # RealSense 相机管理器（可选，延迟初始化）
+        self._camera_manager: Optional[RealSenseManager] = None
+
+        # 相机帧订阅：通过 subscribe_camera_frames action 注册
+        self._camera_frame_subs: Set = set()
+        self._camera_push_task: Optional[asyncio.Task] = None
+
+        # MiniCPM 代理配置（延迟初始化）
+        self._minicpm_cfg: Optional[MiniCPMProxyConfig] = None
+
+        # MiniCPM 聊天会话：id(websocket) -> {"gw_ws": ws, "injector": OutgoingInjector}
+        self._minicpm_sessions: Dict[int, Dict] = {}
+
     # ------------------------------------------------------------------
     # 启动服务
     # ------------------------------------------------------------------
@@ -172,6 +206,12 @@ class RobotWebSocketServer:
 
         # 初始化 AI 组件
         self._init_ai()
+
+        # 启动相机管理器（可选，graceful degradation）
+        self._init_camera()
+
+        # 加载 MiniCPM 代理配置
+        self._init_minicpm_config()
 
         async with websockets.serve(self._handler, self._host, self._port):
             logger.info("WebSocket 服务已启动: ws://%s:%d", self._host, self._port)
@@ -239,11 +279,15 @@ class RobotWebSocketServer:
     # ------------------------------------------------------------------
 
     async def _handler(self, websocket) -> None:
-        """处理单个客户端连接"""
+        """所有连接统一进入主控处理器，通过 action 字段分发指令。"""
+        await self._handle_frontend_ws(websocket)
+
+    async def _handle_frontend_ws(self, websocket) -> None:
+        """处理前端主控 WebSocket 连接"""
         self._clients.add(websocket)
         remote = websocket.remote_address
-        logger.info("客户端已连接: %s", remote)
-        print(f"客户端已连接: {remote}")
+        logger.info("前端客户端已连接: %s", remote)
+        print(f"前端客户端已连接: {remote}")
 
         try:
             async for raw in websocket:
@@ -258,10 +302,13 @@ class RobotWebSocketServer:
                 await self._dispatch(websocket, data)
 
         except websockets.exceptions.ConnectionClosed:
-            logger.info("客户端断开: %s", remote)
+            logger.info("前端客户端断开: %s", remote)
         finally:
             self._clients.discard(websocket)
-            print(f"客户端断开: {remote}")
+            self._camera_frame_subs.discard(websocket)
+            await self._close_minicpm_session(websocket)
+            print(f"前端客户端断开: {remote}")
+
 
     # ------------------------------------------------------------------
     # 指令分发
@@ -308,6 +355,17 @@ class RobotWebSocketServer:
             "init_body":     self._handle_init_body,
             "disconnect":    self._handle_disconnect,
             "test_camera":   self._handle_test_camera,
+            # 相机管理器
+            "camera_status":             self._handle_camera_status,
+            # 相机帧订阅（替代独立 /camera/frames 连接）
+            "subscribe_camera_frames":   self._handle_subscribe_camera_frames,
+            "unsubscribe_camera_frames": self._handle_unsubscribe_camera_frames,
+            # MiniCPM 聊天代理（替代独立 /ws/chat 连接）
+            "chat_connect":              self._handle_chat_connect,
+            "chat_disconnect":           self._handle_chat_disconnect,
+            "chat":                      self._handle_chat_send,
+            # MiniCPM 代理配置查询
+            "minicpm_status": self._handle_minicpm_status,
         }
 
         handler = handlers.get(action)
@@ -936,86 +994,7 @@ class RobotWebSocketServer:
             ))
             return
 
-        self._ai_processing = True
-        self._broadcast_threadsafe({"event": "ai_status_changed", "status": "分析中..."})
-
-        # 在后台线程执行 LLM 调用（避免阻塞 asyncio 事件循环）
-        def _do_ai_work():
-            try:
-                from ..skill_system.models import SkillMatchResult
-
-                # 1. 调用 LLM 进行意图理解
-                skill_summaries = self._skill_engine.list_all_skills()
-                llm_result = self._llm_client.plan(text, skill_summaries)
-
-                if not llm_result.is_valid():
-                    error_msg = llm_result.error or f"无法理解您的意图（置信度: {llm_result.confidence:.0%}）"
-                    self._broadcast_threadsafe({
-                        "event": "ai_skill_not_matched",
-                        "error": error_msg,
-                    })
-                    self._broadcast_threadsafe({"event": "ai_status_changed", "status": "匹配失败"})
-                    return
-
-                # 2. 技能匹配成功
-                skill_match = SkillMatchResult(
-                    skill_id=llm_result.skill_id,
-                    skill_name=llm_result.skill_name,
-                    confidence=llm_result.confidence,
-                    extracted_params=llm_result.parameters,
-                    reasoning=llm_result.reasoning,
-                )
-
-                self._broadcast_threadsafe({
-                    "event": "ai_skill_matched",
-                    "skill_id": llm_result.skill_id,
-                    "skill_name": llm_result.skill_name,
-                    "confidence": llm_result.confidence,
-                    "params": llm_result.parameters,
-                    "reasoning": llm_result.reasoning,
-                })
-
-                # 3. 展开技能为动作序列
-                skill_info = self._skill_engine.get_skill_info(llm_result.skill_id)
-                if skill_info is None:
-                    self._broadcast_threadsafe({
-                        "event": "error",
-                        "message": f"技能 {llm_result.skill_id} 不存在",
-                    })
-                    return
-
-                sequence, validation = self._skill_engine.parse_and_expand(skill_match)
-
-                if not validation.is_valid:
-                    self._broadcast_threadsafe({
-                        "event": "error",
-                        "message": validation.message,
-                    })
-                    return
-
-                # 4. 保存预览数据，推送给前端
-                self._ai_preview_sequence = sequence
-                self._ai_preview_skill_info = skill_info
-
-                self._broadcast_threadsafe({
-                    "event": "ai_preview_ready",
-                    "sequence": [item.to_dict() for item in sequence],
-                    "skill_info": skill_info,
-                })
-                self._broadcast_threadsafe({"event": "ai_status_changed", "status": "预览就绪"})
-
-                logger.info("AI 规划完成: %s → %d 个动作", llm_result.skill_name, len(sequence))
-
-            except Exception as e:
-                logger.error("AI 处理失败: %s", e, exc_info=True)
-                self._broadcast_threadsafe({
-                    "event": "error",
-                    "message": f"AI 处理失败: {str(e)}",
-                })
-            finally:
-                self._ai_processing = False
-
-        self._ai_thread_pool.submit(_do_ai_work)
+        self._start_ai_planning(text)
 
     async def _handle_ai_confirm(self, websocket, data: dict) -> None:
         """
@@ -1100,6 +1079,80 @@ class RobotWebSocketServer:
             "skills": skills,
         }))
 
+    def _start_ai_planning(self, text: str) -> bool:
+        """启动 AI 技能规划（后台线程）。
+
+        返回 True 表示已提交规划任务；False 表示条件不满足（处理中 / 组件不可用）。
+        外部调用方负责事先验证 text 不为空。
+        """
+        if self._ai_processing:
+            return False
+        if self._llm_client is None or not self._llm_client.is_available():
+            return False
+        if self._skill_engine is None:
+            return False
+
+        self._ai_processing = True
+        self._broadcast_threadsafe({"event": "ai_status_changed", "status": "分析中..."})
+
+        def _do_work():
+            try:
+                from ..skill_system.models import SkillMatchResult
+
+                skill_summaries = self._skill_engine.list_all_skills()
+                llm_result = self._llm_client.plan(text, skill_summaries)
+                if not llm_result.is_valid():
+                    error_msg = llm_result.error or f"无法理解您的意图（置信度: {llm_result.confidence:.0%}）"
+                    self._broadcast_threadsafe({"event": "ai_skill_not_matched", "error": error_msg})
+                    self._broadcast_threadsafe({"event": "ai_status_changed", "status": "匹配失败"})
+                    return
+
+                skill_match = SkillMatchResult(
+                    skill_id=llm_result.skill_id,
+                    skill_name=llm_result.skill_name,
+                    confidence=llm_result.confidence,
+                    extracted_params=llm_result.parameters,
+                    reasoning=llm_result.reasoning,
+                )
+                self._broadcast_threadsafe({
+                    "event": "ai_skill_matched",
+                    "skill_id": llm_result.skill_id,
+                    "skill_name": llm_result.skill_name,
+                    "confidence": llm_result.confidence,
+                    "params": llm_result.parameters,
+                    "reasoning": llm_result.reasoning,
+                })
+
+                skill_info = self._skill_engine.get_skill_info(llm_result.skill_id)
+                if skill_info is None:
+                    self._broadcast_threadsafe({"event": "error", "message": f"技能 {llm_result.skill_id} 不存在"})
+                    return
+
+                sequence, validation = self._skill_engine.parse_and_expand(skill_match)
+                if not validation.is_valid:
+                    self._broadcast_threadsafe({"event": "error", "message": validation.message})
+                    return
+
+                self._ai_preview_sequence = sequence
+                self._ai_preview_skill_info = skill_info
+                self._broadcast_threadsafe({
+                    "event": "ai_preview_ready",
+                    "sequence": [item.to_dict() for item in sequence],
+                    "skill_info": skill_info,
+                })
+                self._broadcast_threadsafe({"event": "ai_status_changed", "status": "预览就绪"})
+                logger.info("AI 规划完成: %s → %d 个动作", llm_result.skill_name, len(sequence))
+
+            except Exception as e:
+                logger.error("AI 处理失败: %s", e, exc_info=True)
+                self._broadcast_threadsafe({"event": "error", "message": f"AI 处理失败: {str(e)}"})
+            finally:
+                self._ai_processing = False
+
+        self._ai_thread_pool.submit(_do_work)
+        return True
+
+
     # ==================================================================
     # 设备管理
     # ==================================================================
@@ -1115,6 +1168,18 @@ class RobotWebSocketServer:
             },
             "sequence_length": len(self._current_sequence),
             "ai_processing": self._ai_processing,
+            "camera": {
+                "available": self._camera_manager is not None and self._camera_manager.camera_count > 0,
+                "camera_count": self._camera_manager.camera_count if self._camera_manager else 0,
+                "cameras": self._camera_manager.get_cameras_info() if self._camera_manager else [],
+            },
+            "minicpm": {
+                "configured": self._minicpm_cfg is not None,
+                "gateway": (
+                    f"{self._minicpm_cfg.gateway_scheme}://"
+                    f"{self._minicpm_cfg.gateway_host}:{self._minicpm_cfg.gateway_port}"
+                ) if self._minicpm_cfg else None,
+            },
         }))
 
     async def _handle_init_robots(self, websocket, data: dict) -> None:
@@ -1294,6 +1359,332 @@ class RobotWebSocketServer:
 
         threading.Thread(target=_do_test, daemon=True, name="TestCamera").start()
         await websocket.send(self._json_msg({"event": "log", "message": "正在测试相机..."}))
+
+    # ==================================================================
+    # MiniCPM 代理
+    # ==================================================================
+
+    def _init_minicpm_config(self) -> None:
+        """从 Config 加载 MiniCPM 代理配置。"""
+        try:
+            from ..core.config_loader import Config
+            cfg_dict = Config.get_minicpm_proxy_config()
+            self._minicpm_cfg = MiniCPMProxyConfig(**cfg_dict)
+            logger.info(
+                "MiniCPM 代理已配置: %s://%s:%d",
+                self._minicpm_cfg.gateway_scheme,
+                self._minicpm_cfg.gateway_host,
+                self._minicpm_cfg.gateway_port,
+            )
+        except Exception as exc:
+            logger.warning("MiniCPM 代理配置加载失败: %s", exc)
+            self._minicpm_cfg = None
+
+    async def _handle_minicpm_status(self, websocket, data: dict) -> None:
+        """
+        查询 MiniCPM 网关配置与代理状态
+        请求: {"action": "minicpm_status"}
+        响应: {"event": "minicpm_status", "configured": bool,
+               "gateway": "https://host:port",
+               "ask_enabled": bool}
+        """
+        if self._minicpm_cfg is None:
+            await websocket.send(self._json_msg({
+                "event": "minicpm_status",
+                "configured": False,
+            }))
+            return
+
+        cfg = self._minicpm_cfg
+        await websocket.send(self._json_msg({
+            "event": "minicpm_status",
+            "configured": True,
+            "gateway": f"{cfg.gateway_scheme}://{cfg.gateway_host}:{cfg.gateway_port}",
+            "ask_enabled": cfg.ask_enabled,
+            "chat_action": "chat_connect / chat / chat_disconnect",
+        }))
+
+    # ==================================================================
+    # 相机管理器
+    # ==================================================================
+
+    def _init_camera(self) -> None:
+        """启动 RealSense 相机管理器（graceful degradation）。
+
+        相机列表由配置决定：REALSENSE_DEVICE_SN（逗号分隔序列号）+
+        REALSENSE_DEVICE_NAMES（逗号分隔名称，与序列号一一对应）。
+        若未配置序列号则不启动相机管理器。
+        """
+        try:
+            from ..core.config_loader import Config
+            config = Config.get_instance()
+
+            sn_str = getattr(config, "REALSENSE_DEVICE_SN", "")
+            names_str = getattr(config, "REALSENSE_DEVICE_NAMES", "")
+            serials = [s.strip() for s in sn_str.split(",") if s.strip()] if sn_str else []
+            names = [n.strip() for n in names_str.split(",") if n.strip()] if names_str else []
+
+            if not serials:
+                logger.info("未配置相机序列号，跳过相机管理器初始化")
+                self._camera_manager = None
+                return
+
+            cameras = [
+                {"serial": serial, "name": names[i] if i < len(names) else serial}
+                for i, serial in enumerate(serials)
+            ]
+
+            self._camera_manager = RealSenseManager(
+                cameras=cameras,
+                fps=30,
+                width=640,
+                height=480,
+                jpeg_quality=85,
+            )
+            result = self._camera_manager.start()
+            logger.info(
+                "相机管理器已启动: %d 路在线, %d 路失败",
+                result["started"], result["failed"],
+            )
+            print(f"相机管理器已启动: {result['started']} 路在线, {result['failed']} 路失败")
+        except Exception as exc:
+            logger.info("相机管理器未启动 (%s)", exc)
+            self._camera_manager = None
+
+    async def _handle_camera_status(self, websocket, data: dict) -> None:
+        """
+        查询相机管理器状态
+        请求: {"action": "camera_status"}
+        响应: {
+            "event": "camera_status",
+            "available": bool,          // 是否有在线相机
+            "camera_count": int,        // 在线相机数量
+            "cameras": [                // 所有已配置相机的状态
+                {"serial": "...", "name": "...", "online": true},
+                {"serial": "...", "name": "...", "online": false, "error": "..."}
+            ],
+            "stream_url": "ws://.../camera/stream",
+            "frames_url": "ws://.../camera/frames"
+        }
+        """
+        if self._camera_manager is None:
+            await websocket.send(self._json_msg({
+                "event": "camera_status",
+                "available": False,
+                "camera_count": 0,
+                "cameras": [],
+                "stream_url": f"ws://{self._host}:{self._port}/camera/stream",
+                "frames_url": f"ws://{self._host}:{self._port}/camera/frames",
+            }))
+            return
+
+        cameras_info = self._camera_manager.get_cameras_info()
+        available = self._camera_manager.camera_count > 0
+        await websocket.send(self._json_msg({
+            "event": "camera_status",
+            "available": available,
+            "camera_count": self._camera_manager.camera_count,
+            "cameras": cameras_info,
+            "stream_url": f"ws://{self._host}:{self._port}/camera/stream",
+            "frames_url": f"ws://{self._host}:{self._port}/camera/frames",
+        }))
+
+    # ==================================================================
+    # 相机帧订阅（dispatch 模式，替代独立 /camera/frames WebSocket）
+    # ==================================================================
+
+    async def _handle_subscribe_camera_frames(self, websocket, data: dict) -> None:
+        """订阅相机帧推送。
+        请求: {"action": "subscribe_camera_frames"}
+        成功后服务端持续推送: {"event": "camera_frames", "frames": [...]}
+        """
+        if self._camera_manager is None:
+            await websocket.send(self._json_msg({
+                "event": "camera_error",
+                "message": "未配置任何相机",
+                "cameras": [],
+            }))
+            return
+        if not self._camera_manager.camera_count:
+            await websocket.send(self._json_msg({
+                "event": "camera_error",
+                "message": "所有配置相机均不可用",
+                "cameras": self._camera_manager.get_cameras_info(),
+            }))
+            return
+
+        self._camera_frame_subs.add(websocket)
+        await websocket.send(self._json_msg({"event": "camera_subscribed"}))
+
+        if self._camera_push_task is None or self._camera_push_task.done():
+            self._camera_push_task = asyncio.ensure_future(self._camera_push_loop())
+        logger.info("客户端订阅相机帧: %s", websocket.remote_address)
+
+    async def _handle_unsubscribe_camera_frames(self, websocket, data: dict) -> None:
+        """取消相机帧订阅。
+        请求: {"action": "unsubscribe_camera_frames"}
+        """
+        self._camera_frame_subs.discard(websocket)
+        await websocket.send(self._json_msg({"event": "camera_unsubscribed"}))
+
+    async def _camera_push_loop(self) -> None:
+        """后台任务：以 30fps 向所有订阅客户端推送相机帧。"""
+        interval = 1.0 / 30
+        while self._camera_frame_subs:
+            if self._camera_manager:
+                jpegs = self._camera_manager.get_latest_jpegs()
+                if jpegs:
+                    payload = json.dumps({
+                        "event": "camera_frames",
+                        "frames": [
+                            {
+                                "serial": serial,
+                                "name": name,
+                                "index": idx,
+                                "data": base64.b64encode(jpeg).decode("ascii"),
+                            }
+                            for idx, (serial, name, jpeg) in enumerate(jpegs)
+                        ],
+                    }, ensure_ascii=False)
+                    dead: List = []
+                    for ws in list(self._camera_frame_subs):
+                        try:
+                            await ws.send(payload)
+                        except Exception:
+                            dead.append(ws)
+                    for ws in dead:
+                        self._camera_frame_subs.discard(ws)
+            await asyncio.sleep(interval)
+        self._camera_push_task = None
+
+    # ==================================================================
+    # MiniCPM 聊天代理（dispatch 模式，替代独立 /ws/chat WebSocket）
+    # ==================================================================
+
+    async def _handle_chat_connect(self, websocket, data: dict) -> None:
+        """标记聊天会话激活（不预先连接网关）。
+        请求: {"action": "chat_connect"}
+        成功: {"event": "chat_connected"}
+
+        MiniCPM /ws/chat 是一次性连接（一问一答后网关自动关闭），
+        因此每次发消息时才临时连接网关，会话标记独立于网关连接状态。
+        """
+        if self._minicpm_cfg is None:
+            await websocket.send(self._json_msg({
+                "event": "error", "message": "MiniCPM 代理未配置"
+            }))
+            return
+        if id(websocket) in self._minicpm_sessions:
+            await websocket.send(self._json_msg({
+                "event": "error", "message": "聊天会话已连接，请先断开"
+            }))
+            return
+
+        self._minicpm_sessions[id(websocket)] = {"active": True}
+        await websocket.send(self._json_msg({"event": "chat_connected"}))
+        logger.info("MiniCPM 聊天会话已就绪: %s", websocket.remote_address)
+
+    async def _handle_chat_disconnect(self, websocket, data: dict) -> None:
+        """断开 MiniCPM 聊天会话。
+        请求: {"action": "chat_disconnect"}
+        """
+        self._minicpm_sessions.pop(id(websocket), None)
+        await websocket.send(self._json_msg({"event": "chat_disconnected"}))
+
+    async def _handle_chat_send(self, websocket, data: dict) -> None:
+        """发送聊天消息：每次临时连接网关、收完响应后关闭，不影响会话状态。
+        请求: {"action": "chat", "messages": [...], "streaming": true, ...}
+        服务端持续推送: {"event": "chat_data", "raw": "..."}
+        """
+        if id(websocket) not in self._minicpm_sessions:
+            await websocket.send(self._json_msg({
+                "event": "error", "message": "请先发送 chat_connect 建立聊天会话"
+            }))
+            return
+
+        cfg = self._minicpm_cfg
+        gw_url = f"{cfg.gateway_ws_base}/ws/chat"
+        try:
+            gw_ws = await websockets.connect(
+                gw_url,
+                ssl=cfg.ssl_ctx(),
+                max_size=100 * 1024 * 1024,
+                open_timeout=30,
+            )
+        except Exception as exc:
+            await websocket.send(self._json_msg({
+                "event": "error", "message": f"连接 MiniCPM 网关失败: {exc}"
+            }))
+            return
+
+        # 每条消息用独立注入器（网关连接是全新的，需重新注入系统提示）
+        injector = OutgoingInjector("chat")
+        payload = {k: v for k, v in data.items() if k != "action"}
+        processed = injector.process(json.dumps(payload, ensure_ascii=False))
+        try:
+            await gw_ws.send(processed)
+        except Exception as exc:
+            await gw_ws.close()
+            await websocket.send(self._json_msg({
+                "event": "error", "message": f"发送消息失败: {exc}"
+            }))
+            return
+
+        # 后台接收响应，网关关闭后不影响客户端会话状态
+        asyncio.ensure_future(self._minicpm_recv_once(websocket, gw_ws))
+
+        # 指令分类
+        try:
+            user_text = _extract_user_text(payload)
+            if user_text:
+                await self._on_chat_user_text(user_text)
+        except Exception:
+            pass
+
+    async def _minicpm_recv_once(self, client_ws, gw_ws) -> None:
+        """接收单次 MiniCPM 响应并转发，网关关闭后不改变客户端会话状态。"""
+        try:
+            async for raw in gw_ws:
+                try:
+                    text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+                    await client_ws.send(self._json_msg({
+                        "event": "chat_data",
+                        "raw": text,
+                    }))
+                except Exception:
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                await gw_ws.close()
+            except Exception:
+                pass
+            logger.debug("MiniCPM 单次响应结束")
+
+    async def _close_minicpm_session(self, websocket) -> None:
+        """清理指定客户端的 MiniCPM 会话标记。"""
+        self._minicpm_sessions.pop(id(websocket), None)
+
+    async def _on_chat_user_text(self, text: str) -> None:
+        """对聊天用户输入进行指令分类，必要时触发 AI 技能规划。"""
+        if not text.strip():
+            return
+        cfg = self._minicpm_cfg
+        ask_result = await classify_instruction(
+            text,
+            api_key=cfg.ask_api_key if cfg else "",
+            base_url=cfg.ask_base_url if cfg else "",
+            model=cfg.ask_model if cfg else "gpt-4o-mini",
+            enabled=cfg.ask_enabled if cfg else False,
+        )
+        if not ask_result.get("is_Instruction", False):
+            logger.debug("用户输入非指令，跳过规划: %s", text[:60])
+            return
+        instruction = ask_result.get("Instruction", text)
+        logger.info("检测到机器人指令，触发 AI 规划: %s", instruction)
+        if not self._start_ai_planning(instruction):
+            logger.debug("AI 规划未启动（处理中或组件不可用），指令: %s", instruction)
 
     # ==================================================================
     # 序列解析

@@ -31,6 +31,7 @@ class Config:
     
     # RealSense 相机配置
     REALSENSE_DEVICE_SN: str = ""
+    REALSENSE_DEVICE_NAMES: str = ""
     VISION_CAMERA_HOST: str = "localhost"
     VISION_CAMERA_PORT: int = 12345
     YOLO_MODEL_PATH: str = "models/best.pt"
@@ -74,10 +75,16 @@ class Config:
     
     # WebSocket 服务器配置
     WEBSOCKET_HOST: str = "0.0.0.0"
-    WEBSOCKET_PORT: int = 9000
-    EXTERNAL_API_HOST: str = "0.0.0.0"
-    EXTERNAL_API_HTTP_PORT: int = 8765
-    EXTERNAL_API_WS_URL: str = "ws://localhost:8005/robot/ws"
+    WEBSOCKET_PORT: int = 8765
+
+    # MiniCPM 聊天代理配置
+    MINICPM_GATEWAY_HOST: str = "localhost"
+    MINICPM_GATEWAY_PORT: int = 8006
+    MINICPM_GATEWAY_SCHEME: str = "https"
+    MINICPM_ASK_ENABLED: bool = True
+    MINICPM_ASK_API_KEY: str = ""
+    MINICPM_ASK_BASE_URL: str = ""
+    MINICPM_ASK_MODEL: str = "gpt-4o-mini"
     
     # 位置配置
     INITIAL_POSE: list = None
@@ -136,7 +143,8 @@ class Config:
         instance.SIMULATION_MODE = os.getenv("SIMULATION_MODE", "false").lower() in ("true", "1", "yes")
         instance.SKILL_LIBRARY_PATH = os.getenv("SKILL_LIBRARY_PATH", "data/skills/skill_library.json")
         instance.REALSENSE_DEVICE_SN = os.getenv("REALSENSE_DEVICE_SN", "")
-        
+        instance.REALSENSE_DEVICE_NAMES = os.getenv("REALSENSE_DEVICE_NAMES", "")
+
         # RealSense 相机配置
         instance.VISION_CAMERA_HOST = os.getenv("VISION_CAMERA_HOST", "localhost")
         instance.VISION_CAMERA_PORT = int(os.getenv("VISION_CAMERA_PORT", "12345"))
@@ -181,10 +189,17 @@ class Config:
         
         # WebSocket 服务器配置
         instance.WEBSOCKET_HOST = os.getenv("WEBSOCKET_HOST", "0.0.0.0")
-        instance.WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", "9000"))
-        instance.EXTERNAL_API_HOST = os.getenv("EXTERNAL_API_HOST", "0.0.0.0")
-        instance.EXTERNAL_API_HTTP_PORT = int(os.getenv("EXTERNAL_API_HTTP_PORT", "8765"))
-        instance.EXTERNAL_API_WS_URL = os.getenv("EXTERNAL_API_WS_URL", "ws://localhost:8005/robot/ws")
+        instance.WEBSOCKET_PORT = int(os.getenv("WEBSOCKET_PORT", "8765"))
+
+        # MiniCPM 聊天代理配置
+        instance.MINICPM_GATEWAY_HOST = os.getenv("MINICPM_GATEWAY_HOST", "localhost")
+        instance.MINICPM_GATEWAY_PORT = int(os.getenv("MINICPM_GATEWAY_PORT", "8006"))
+        instance.MINICPM_GATEWAY_SCHEME = os.getenv("MINICPM_GATEWAY_SCHEME", "https")
+        instance.MINICPM_ASK_ENABLED = os.getenv(
+            "MINICPM_ASK_ENABLED", "true").lower() in ("true", "1", "yes")
+        instance.MINICPM_ASK_API_KEY = os.getenv("MINICPM_ASK_API_KEY", "")
+        instance.MINICPM_ASK_BASE_URL = os.getenv("MINICPM_ASK_BASE_URL", "")
+        instance.MINICPM_ASK_MODEL = os.getenv("MINICPM_ASK_MODEL", "gpt-4o-mini")
         
         # 位置配置
         instance.INITIAL_POSE = cls._parse_float_list(os.getenv("INITIAL_POSE", "-0.303379,0.274441,-0.075986,-3.081,0.137,-1.828"))
@@ -193,6 +208,18 @@ class Config:
         instance.PLACE_DROP_HEIGHT = float(os.getenv("PLACE_DROP_HEIGHT", "0.06"))
         instance.PLACE_ABOVE = cls._parse_float_list(os.getenv("PLACE_ABOVE", "0.0637,-0.07351,-0.4182,3.15,0,1.617"))
         instance.PLACE_POS2 = cls._parse_float_list(os.getenv("PLACE_POS2", "0.285488,-0.256408,-0.090654,3.14,0,1.5"))
+
+        # 枪头更换位置配置
+        instance.GUN1_POSITIONS = {
+            "1shang": cls._parse_float_list(os.getenv("GUN1_1SHANG", "")),
+            "1xia":   cls._parse_float_list(os.getenv("GUN1_1XIA", "")),
+            "1zhong": cls._parse_float_list(os.getenv("GUN1_1ZHONG", "")),
+        }
+        instance.GUN2_POSITIONS = {
+            "2shang": cls._parse_float_list(os.getenv("GUN2_2SHANG", "")),
+            "2xia":   cls._parse_float_list(os.getenv("GUN2_2XIA", "")),
+            "2zhong": cls._parse_float_list(os.getenv("GUN2_2ZHONG", "")),
+        }
 
         cls._loaded = True
         return instance
@@ -348,13 +375,17 @@ class Config:
         }
 
     @classmethod
-    def get_external_api_config(cls) -> dict:
-        """获取外部 API 服务器配置"""
+    def get_minicpm_proxy_config(cls) -> dict:
+        """获取 MiniCPM 聊天代理配置"""
         instance = cls.get_instance()
         return {
-            "host": instance.EXTERNAL_API_HOST,
-            "http_port": instance.EXTERNAL_API_HTTP_PORT,
-            "ws_url": instance.EXTERNAL_API_WS_URL
+            "gateway_host": instance.MINICPM_GATEWAY_HOST,
+            "gateway_port": instance.MINICPM_GATEWAY_PORT,
+            "gateway_scheme": instance.MINICPM_GATEWAY_SCHEME,
+            "ask_enabled": instance.MINICPM_ASK_ENABLED,
+            "ask_api_key": instance.MINICPM_ASK_API_KEY or instance.OPENAI_API_KEY,
+            "ask_base_url": instance.MINICPM_ASK_BASE_URL or instance.OPENAI_BASE_URL,
+            "ask_model": instance.MINICPM_ASK_MODEL,
         }
     
     @classmethod

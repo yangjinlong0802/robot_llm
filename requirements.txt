@@ -8,3 +8,4 @@ pyserial>=3.5
 ultralytics>=8.4.36
 scikit-learn>=1.8.0
 robotic-arm>=1.1.5
+pyrealsense2>=2.57.7.10387

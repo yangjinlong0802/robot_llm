@@ -32,6 +32,8 @@ WebSocket 服务已启动: ws://0.0.0.0:8765
 
 ### 2. 前端连接
 
+所有功能都通过 **一条 WebSocket 连接** 完成，无需建立多条连接。
+
 ```javascript
 const ws = new WebSocket("ws://localhost:8765");
 
@@ -756,6 +758,254 @@ ws.send(JSON.stringify({ action: "list_skills" }));
 
 ---
 
+### 七、相机流媒体
+
+服务端通过 `subscribe_camera_frames` 向客户端推送相机画面，无需建立额外 WebSocket 连接。
+
+#### 查询相机状态
+
+```javascript
+ws.send(JSON.stringify({ action: "camera_status" }));
+```
+
+响应：
+
+```json
+{
+  "event": "camera_status",
+  "available": true,
+  "camera_count": 2,
+  "cameras": [
+    {"serial": "153122077516", "name": "左臂相机", "online": true},
+    {"serial": "153122077517", "name": "右臂相机", "online": false, "error": "设备未找到"}
+  ]
+}
+```
+
+#### 订阅相机帧
+
+```javascript
+ws.send(JSON.stringify({ action: "subscribe_camera_frames" }));
+```
+
+成功响应：
+
+```json
+{"event": "camera_subscribed"}
+```
+
+订阅后，服务端以约 30fps 持续推送帧数据：
+
+```json
+{
+  "event": "camera_frames",
+  "frames": [
+    {
+      "serial": "153122077516",
+      "name": "左臂相机",
+      "index": 0,
+      "data": "<base64编码的JPEG图像>"
+    },
+    {
+      "serial": "153122077517",
+      "name": "右臂相机",
+      "index": 1,
+      "data": "<base64编码的JPEG图像>"
+    }
+  ]
+}
+```
+
+前端渲染示例：
+
+```javascript
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  if (data.event === "camera_frames") {
+    for (const frame of data.frames) {
+      const img = document.getElementById(`cam-${frame.index}`);
+      if (img) img.src = `data:image/jpeg;base64,${frame.data}`;
+    }
+  }
+};
+```
+
+#### 取消订阅相机帧
+
+```javascript
+ws.send(JSON.stringify({ action: "unsubscribe_camera_frames" }));
+```
+
+响应：
+
+```json
+{"event": "camera_unsubscribed"}
+```
+
+若相机不可用，订阅请求会返回错误：
+
+```json
+{"event": "camera_error", "message": "未配置任何相机", "cameras": []}
+```
+
+---
+
+### 八、MiniCPM 聊天代理
+
+通过标准 `action` 协议将 MiniCPM 视觉语言模型的聊天能力集成到主连接中，无需额外 WebSocket 连接。服务端会自动将消息转发至 MiniCPM 网关，并注入系统提示。
+
+#### 查询 MiniCPM 状态
+
+```javascript
+ws.send(JSON.stringify({ action: "minicpm_status" }));
+```
+
+响应（已配置时）：
+
+```json
+{
+  "event": "minicpm_status",
+  "configured": true,
+  "gateway": "https://localhost:8006",
+  "ask_enabled": true,
+  "chat_action": "chat_connect / chat / chat_disconnect"
+}
+```
+
+响应（未配置时）：
+
+```json
+{
+  "event": "minicpm_status",
+  "configured": false
+}
+```
+
+MiniCPM 相关配置项在 `config.env` 中：
+
+```env
+MINICPM_GATEWAY_HOST=localhost
+MINICPM_GATEWAY_PORT=8006
+MINICPM_GATEWAY_SCHEME=https
+ASK_ENABLED=true
+ASK_API_KEY=sk-xxx
+ASK_BASE_URL=https://api.openai.com/v1
+ASK_MODEL=gpt-4o-mini
+```
+
+#### 建立聊天会话
+
+在发送消息前，需先建立会话（仅标记状态，不连接网关）：
+
+```javascript
+ws.send(JSON.stringify({ action: "chat_connect" }));
+```
+
+响应：
+
+```json
+{"event": "chat_connected"}
+```
+
+#### 发送聊天消息
+
+每条消息会独立连接 MiniCPM 网关，接收完整响应后关闭网关连接，**不影响客户端会话状态**，无需重新 `chat_connect` 即可继续发送下一条消息。
+
+```javascript
+ws.send(JSON.stringify({
+  action: "chat",
+  messages: [
+    { role: "user", content: "描述一下你看到的图像" }
+  ],
+  streaming: true,
+  generation: {
+    max_new_tokens: 512,
+    temperature: 0.7,
+    top_p: 0.8
+  }
+}));
+```
+
+服务端持续推送响应片段：
+
+```json
+{"event": "chat_data", "raw": "{\"text\": \"我看到...\"}"}
+{"event": "chat_data", "raw": "{\"text\": \"一个红色的瓶子\"}"}
+```
+
+`raw` 字段为 MiniCPM 网关原始 JSON 字符串，结构通常为：
+
+```json
+{"text": "回复文本片段", "finish_reason": null}
+{"text": "", "finish_reason": "stop"}
+```
+
+当检测到消息中包含可执行机器人指令时，服务端还会额外推送：
+
+```json
+{"event": "minicpm_instruction", "instruction": "抓瓶子"}
+```
+
+#### 断开聊天会话
+
+```javascript
+ws.send(JSON.stringify({ action: "chat_disconnect" }));
+```
+
+响应：
+
+```json
+{"event": "chat_disconnected"}
+```
+
+#### 完整聊天流程示例
+
+```javascript
+// 1. 建立会话
+ws.send(JSON.stringify({ action: "chat_connect" }));
+
+// 2. 监听响应
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+
+  if (data.event === "chat_connected") {
+    console.log("聊天就绪，可以发消息");
+  }
+
+  if (data.event === "chat_data") {
+    // 解析 MiniCPM 原始响应
+    try {
+      const chunk = JSON.parse(data.raw);
+      if (chunk.text) process.stdout.write(chunk.text);
+    } catch (e) {}
+  }
+
+  if (data.event === "minicpm_instruction") {
+    console.log("检测到机器人指令:", data.instruction);
+    // 可在此触发 AI 规划或直接执行
+  }
+};
+
+// 3. 发送消息（可多次，无需重连）
+ws.send(JSON.stringify({
+  action: "chat",
+  messages: [{ role: "user", content: "帮我抓瓶子" }],
+  streaming: true
+}));
+
+// 4. 再次发送（会话保持）
+ws.send(JSON.stringify({
+  action: "chat",
+  messages: [{ role: "user", content: "现在放下" }],
+  streaming: true
+}));
+
+// 5. 结束会话
+ws.send(JSON.stringify({ action: "chat_disconnect" }));
+```
+
+---
+
 ## 前端集成示例
 
 ### React Hook 示例
@@ -917,6 +1167,9 @@ export function useRobotWS(url = 'ws://localhost:8765') {
 | 机械臂控制器未初始化 | 未连接硬件 | 发 `init_robots` 或用 `--simulation` 启动 |
 | LLM 不可用 | API Key 未配置 | 检查 `config.env` 中的 `OPENAI_API_KEY` |
 | 无效的动作类型 | type 值不在枚举中 | 使用: `MOVE_TO_POINT` / `ARM_ACTION` / `INSPECT_AND_OUTPUT` / `CHANGE_GUN` / `VISION_CAPTURE` |
+| 请先发送 chat_connect 建立聊天会话 | 未建立会话就发消息 | 先发 `chat_connect` |
+| 连接 MiniCPM 网关失败 | 网关不可达 | 检查 `config.env` 中的 `MINICPM_GATEWAY_*` 配置 |
+| 未配置任何相机 | 未设置相机序列号 | 在 `config.env` 中配置 `REALSENSE_DEVICE_SN` |
 
 ---
 
@@ -955,4 +1208,16 @@ export function useRobotWS(url = 'ws://localhost:8765') {
 1. create_action × N     → 创建多个动作模板
 2. add_to_sequence       → 用 action_ids 引用已创建的动作
 3. save_task             → 保存
+```
+
+### 流程5: 相机画面 + 聊天问答
+
+```
+1. camera_status                 → 确认相机是否在线
+2. subscribe_camera_frames       → 开始接收画面（30fps 推送）
+3. chat_connect                  → 建立 MiniCPM 会话
+4. chat (messages=[...])         → 发送问题，接收流式回答
+5. 监听 minicpm_instruction      → 检测到机器人指令时触发执行
+6. chat_disconnect               → 结束聊天
+7. unsubscribe_camera_frames     → 停止画面推送
 ```

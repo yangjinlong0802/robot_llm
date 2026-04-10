@@ -90,7 +90,7 @@ def run_gui():
     sys.exit(app.exec())
 
 
-def run_server(args):
+def run_server(args, config=None):
     """启动 WebSocket Server 模式"""
     # 初始化硬件
     robot_controller, body_controller = init_hardware(args.simulation)
@@ -98,16 +98,20 @@ def run_server(args):
     # 启动 WebSocket 服务
     from ..robot_server.ws_server import RobotWebSocketServer
 
+    # 优先使用命令行参数，其次使用 config.env 配置，最后使用默认值
+    host = args.host if args.host != "0.0.0.0" else (config.WEBSOCKET_HOST if config else "0.0.0.0")
+    port = args.port if args.port != 8765 else (config.WEBSOCKET_PORT if config else 8765)
+
     server = RobotWebSocketServer(
         robot_controller=robot_controller,
         body_controller=body_controller,
-        host=args.host,
-        port=args.port,
+        host=host,
+        port=port,
     )
 
     print("=" * 50)
     print(f"机器人 WebSocket 控制服务")
-    print(f"地址：ws://{args.host}:{args.port}")
+    print(f"地址：ws://{host}:{port}")
     print(f"模式：{'模拟' if args.simulation else '硬件'}")
     print("=" * 50)
 
@@ -130,16 +134,17 @@ def main():
 
     # 加载配置
     run_mode = "server"  # 默认值
+    config = None
     try:
         from .config_loader import Config
         config = Config.get_instance()  # 使用 get_instance() 确保实例已创建
-        
+
         # 从配置加载器读取 RUN_MODE 和 SIMULATION_MODE
         run_mode = config.RUN_MODE.lower()
         if config.SIMULATION_MODE:
             args.simulation = True
             print("config.env 中 SIMULATION_MODE=True，启用模拟模式")
-        
+
         print(f"config.env 中 RUN_MODE={run_mode.upper()}")
     except Exception as e:
         print(f"加载配置失败：{e}，使用默认值")
@@ -151,7 +156,7 @@ def main():
         run_gui()
     else:
         print("启动模式：WebSocket Server")
-        run_server(args)
+        run_server(args, config)
 
 
 if __name__ == '__main__':

@@ -129,12 +129,15 @@ def ensure_config_loaded():
     MAX_ATTEMPTS = config['max_attempts']
     MOVE_SPEED = config['move_speed']
     
-    # 从 config.env 加载枪头位置（如果配置了）
+    # 从 config.env 加载枪头位置
     try:
         from ..core.config_loader import Config
         cfg = Config.get_instance()
-        # TODO: 将枪头位置也加入配置加载器
-    except:
+        if cfg.GUN1_POSITIONS:
+            GUN1_POSITIONS = cfg.GUN1_POSITIONS
+        if cfg.GUN2_POSITIONS:
+            GUN2_POSITIONS = cfg.GUN2_POSITIONS
+    except Exception:
         pass
 
 # 模块导入时自动加载配置

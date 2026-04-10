@@ -50,6 +50,24 @@ from sklearn.mixture import GaussianMixture
 from ultralytics import YOLO, SAM
 
 # ---------------------------------------------------------------
+# 从统一配置加载默认值
+# ---------------------------------------------------------------
+try:
+    from ..core.config_loader import Config
+    _config = Config.get_instance()
+    _DEFAULT_YOLO_MODEL_PATH = _config.YOLO_MODEL_PATH
+    _DEFAULT_SAM_MODEL_PATH = _config.SAM_MODEL_PATH
+    _DEFAULT_VISION_DEBUG_SAVE_DIR = _config.VISION_DEBUG_SAVE_DIR
+    _DEFAULT_FRAME_SOCKET_HOST = _config.VISION_CAMERA_HOST
+    _DEFAULT_FRAME_SOCKET_PORT = _config.VISION_CAMERA_PORT
+except Exception:
+    _DEFAULT_YOLO_MODEL_PATH = "models/best.pt"
+    _DEFAULT_SAM_MODEL_PATH = "models/sam2.1_l.pt"
+    _DEFAULT_VISION_DEBUG_SAVE_DIR = "pictures"
+    _DEFAULT_FRAME_SOCKET_HOST = "localhost"
+    _DEFAULT_FRAME_SOCKET_PORT = 12345
+
+# ---------------------------------------------------------------
 # 路径与导入
 # ---------------------------------------------------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -77,7 +95,7 @@ except ImportError:
 # ---------------------------------------------------------------
 # 调试图片保存根目录（可用 VisionCaptureAction(debug_save_root=...) 覆盖）
 # ---------------------------------------------------------------
-_DEBUG_SAVE_ROOT = _PICTURE_DIR_DEFAULT
+_DEBUG_SAVE_ROOT = _DEFAULT_VISION_DEBUG_SAVE_DIR
 
 # ---------------------------------------------------------------
 # 模型缓存（避免重复加载）
@@ -314,10 +332,10 @@ class VisionCaptureAction:
         self,
         controller = None,          # RobotController | None
         frame_source: Literal["auto", "controller", "socket"] = "auto",
-        frame_socket_host: str = "localhost",
-        frame_socket_port: int = 12345,
-        yolo_model_path: str = "/home/maic/10-robotgui/src/best.pt",
-        sam_model_path: str = "/home/maic/10-robotgui/src/sam2.1_l.pt",
+        frame_socket_host: str = None,
+        frame_socket_port: int = None,
+        yolo_model_path: str = None,
+        sam_model_path: str = None,
         target_robot: Literal["robot1", "robot2"] = "robot1",
         workflow: Literal["vertical", "bottle"] = "vertical",
         gripper_offset: list = None,
@@ -332,12 +350,13 @@ class VisionCaptureAction:
         debug_save_root: str = None,
         raise_on_error: bool = True
     ):
+        # 使用 config.env 中的配置作为默认值
+        self.frame_socket_host = frame_socket_host or _DEFAULT_FRAME_SOCKET_HOST
+        self.frame_socket_port = frame_socket_port or _DEFAULT_FRAME_SOCKET_PORT
+        self.yolo_model_path   = yolo_model_path or _DEFAULT_YOLO_MODEL_PATH
+        self.sam_model_path    = sam_model_path or _DEFAULT_SAM_MODEL_PATH
         self.controller        = controller
         self.frame_source      = frame_source
-        self.frame_socket_host = frame_socket_host
-        self.frame_socket_port = frame_socket_port
-        self.yolo_model_path   = yolo_model_path
-        self.sam_model_path    = sam_model_path
         self.target_robot      = target_robot
         self.workflow          = workflow
 
@@ -361,7 +380,7 @@ class VisionCaptureAction:
         self.image_width       = image_width
         self.image_height      = image_height
         self.save_debug_images = save_debug_images
-        self.debug_save_root   = (debug_save_root or _DEBUG_SAVE_ROOT)
+        self.debug_save_root   = (debug_save_root or _DEFAULT_VISION_DEBUG_SAVE_DIR)
         self.raise_on_error   = raise_on_error
 
         self._process_mask_fn: Callable = process_mask_with_gmm
@@ -655,8 +674,6 @@ if __name__ == "__main__":
     print("=" * 60)
 
     action = VisionCaptureAction(
-        yolo_model_path = "/home/maic/10-robotgui/src/best.pt",
-        sam_model_path  = "/home/maic/10-robotgui/src/sam2.1_l.pt",
         target_robot    = "robot1",
         save_debug_images = True,
     )
