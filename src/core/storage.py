@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 from typing import List
+from uuid import uuid4
 
 from .models import ActionDefinition, SequenceItem
 
@@ -32,6 +33,16 @@ class StorageManager:
             return []
         with open(cls.ACTIONS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+
+        # 自动补全缺失的 id（旧数据迁移）
+        need_save = any(not item.get("id") for item in data)
+        if need_save:
+            for item in data:
+                if not item.get("id"):
+                    item["id"] = str(uuid4())
+            with open(cls.ACTIONS_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
         return [ActionDefinition.from_dict(item) for item in data]
 
     @classmethod

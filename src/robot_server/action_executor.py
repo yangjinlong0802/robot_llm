@@ -460,7 +460,7 @@ class ActionExecutor:
 
             grabber_sn = None
             try:
-                from .config_loader import Config
+                from ..core.config_loader import Config
                 sn = Config.get_instance().REALSENSE_DEVICE_SN
                 if sn:
                     grabber_sn = sn

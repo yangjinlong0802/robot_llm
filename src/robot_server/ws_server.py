@@ -181,6 +181,10 @@ class RobotWebSocketServer:
         # MiniCPM 聊天会话：id(websocket) -> {"gw_ws": ws, "injector": OutgoingInjector}
         self._minicpm_sessions: Dict[int, Dict] = {}
 
+        # AI 执行跟踪（用于发送 ai_execution_finished 事件）
+        self._ai_execution_pending = False
+        self._execution_had_failure = False
+
     # ------------------------------------------------------------------
     # 启动服务
     # ------------------------------------------------------------------
@@ -461,6 +465,8 @@ class RobotWebSocketServer:
     async def _handle_stop(self, websocket, data: dict) -> None:
         """停止执行"""
         if self._executor.is_running:
+            if self._ai_execution_pending:
+                self._execution_had_failure = True  # 人工停止视为未成功完成
             self._executor.stop()
             await websocket.send(self._json_msg(
                 {"event": "stopped", "message": "已发送停止指令"}
@@ -1020,6 +1026,10 @@ class RobotWebSocketServer:
         # 同步到当前序列
         self._current_sequence = list(sequence)
 
+        # 标记本次为 AI 触发执行，以便 _on_finished 发送 ai_execution_finished 事件
+        self._ai_execution_pending = True
+        self._execution_had_failure = False
+
         await self._broadcast({
             "event": "accepted",
             "message": "AI 序列开始执行",
@@ -1467,14 +1477,15 @@ class RobotWebSocketServer:
             "frames_url": "ws://.../camera/frames"
         }
         """
+        display_host = "localhost" if self._host == "0.0.0.0" else self._host
         if self._camera_manager is None:
             await websocket.send(self._json_msg({
                 "event": "camera_status",
                 "available": False,
                 "camera_count": 0,
                 "cameras": [],
-                "stream_url": f"ws://{self._host}:{self._port}/camera/stream",
-                "frames_url": f"ws://{self._host}:{self._port}/camera/frames",
+                "stream_url": f"ws://{display_host}:{self._port}/camera/stream",
+                "frames_url": f"ws://{display_host}:{self._port}/camera/frames",
             }))
             return
 
@@ -1485,8 +1496,8 @@ class RobotWebSocketServer:
             "available": available,
             "camera_count": self._camera_manager.camera_count,
             "cameras": cameras_info,
-            "stream_url": f"ws://{self._host}:{self._port}/camera/stream",
-            "frames_url": f"ws://{self._host}:{self._port}/camera/frames",
+            "stream_url": f"ws://{display_host}:{self._port}/camera/stream",
+            "frames_url": f"ws://{display_host}:{self._port}/camera/frames",
         }))
 
     # ==================================================================
@@ -1558,7 +1569,7 @@ class RobotWebSocketServer:
         self._camera_push_task = None
 
     # ==================================================================
-    # MiniCPM 聊天代理（dispatch 模式，替代独立 /ws/chat WebSocket）
+    # MiniCPM 聊天代理（dispatch 模式）
     # ==================================================================
 
     async def _handle_chat_connect(self, websocket, data: dict) -> None:
@@ -1683,6 +1694,7 @@ class RobotWebSocketServer:
             return
         instruction = ask_result.get("Instruction", text)
         logger.info("检测到机器人指令，触发 AI 规划: %s", instruction)
+        self._broadcast_threadsafe({"event": "minicpm_instruction", "instruction": instruction})
         if not self._start_ai_planning(instruction):
             logger.debug("AI 规划未启动（处理中或组件不可用），指令: %s", instruction)
 
@@ -1736,6 +1748,7 @@ class RobotWebSocketServer:
         })
 
     def _on_step_failed(self, index: int, item: SequenceItem, error: str) -> None:
+        self._execution_had_failure = True
         self._broadcast_threadsafe({
             "event": "step_failed",
             "index": index,
@@ -1751,6 +1764,14 @@ class RobotWebSocketServer:
         })
 
     def _on_finished(self) -> None:
+        if self._ai_execution_pending:
+            self._ai_execution_pending = False
+            success = not self._execution_had_failure
+            self._broadcast_threadsafe({
+                "event": "ai_execution_finished",
+                "success": success,
+                "message": "AI 序列执行完成" if success else "AI 序列执行失败",
+            })
         self._broadcast_threadsafe({
             "event": "execution_finished",
         })

@@ -176,7 +176,6 @@
     <div class="status-item"><div class="status-dot" id="dev-robot1"></div><span id="dev-robot1-text">R1: 未连接</span></div>
     <div class="status-item"><div class="status-dot" id="dev-robot2"></div><span id="dev-robot2-text">R2: 未连接</span></div>
     <div class="status-item"><div class="status-dot" id="dev-body"></div><span id="dev-body-text">身体: 未连接</span></div>
-    <div class="status-item"><div class="status-dot" id="dev-pipette"></div><span id="dev-pipette-text">移液枪: 未初始化</span></div>
   </div>
 </div>
 
@@ -520,6 +519,19 @@ function handleEvent(data) {
   // 相机
   if (ev === 'camera_test_result') {
     appendLog('[相机测试] ' + data.message);
+  }
+
+  // MiniCPM 指令检测
+  if (ev === 'minicpm_instruction') {
+    appendLog('[MiniCPM 指令] ' + data.instruction);
+    addAIMsg('sys', '检测到指令，正在规划: ' + data.instruction);
+  }
+
+  // AI 执行完成（与 execution_finished 并列推送）
+  if (ev === 'ai_execution_finished') {
+    const icon = data.success ? '✓' : '✗';
+    addAIMsg(data.success ? 'bot' : 'sys', icon + ' ' + (data.message || 'AI 序列执行结束'));
+    resetAIButtons();
   }
 
   // 通用响应
