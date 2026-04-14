@@ -4,7 +4,7 @@
 MiniCPM 网关，同时在每个会话中注入 SCRIPT_SYSTEM_PROMPT。
 
 用法（在 ws_server.py 中）:
-    cfg = MiniCPMProxyConfig(gateway_host="localhost", gateway_port=8006)
+    cfg = MiniCPMProxyConfig(gateway_host="application.himat.wiat.ac.cn", gateway_path_prefix="/minicpm")
     await proxy_chat(client_ws, cfg, on_user_message=self._on_minicpm_user_message)
     await proxy_duplex(client_ws, cfg, path_suffix, mode)
 """
@@ -38,6 +38,7 @@ class MiniCPMProxyConfig:
         gateway_host: str = "localhost",
         gateway_port: int = 8006,
         gateway_scheme: str = "https",   # "http" 或 "https"
+        gateway_path_prefix: str = "",   # 外网反向代理路径前缀，如 "/minicpm"
         ask_enabled: bool = True,
         ask_api_key: str = "",
         ask_base_url: str = "https://api.openai.com/v1",
@@ -46,6 +47,7 @@ class MiniCPMProxyConfig:
         self.gateway_host = gateway_host
         self.gateway_port = gateway_port
         self.gateway_scheme = gateway_scheme
+        self.gateway_path_prefix = gateway_path_prefix.rstrip("/")
         self.ask_enabled = ask_enabled
         self.ask_api_key = ask_api_key
         self.ask_base_url = ask_base_url
@@ -56,8 +58,14 @@ class MiniCPMProxyConfig:
         return "wss" if self.gateway_scheme == "https" else "ws"
 
     @property
+    def _port_suffix(self) -> str:
+        """仅当端口非默认值时才附加 :port。"""
+        default = 443 if self.gateway_scheme == "https" else 80
+        return "" if self.gateway_port == default else f":{self.gateway_port}"
+
+    @property
     def gateway_ws_base(self) -> str:
-        return f"{self.ws_scheme}://{self.gateway_host}:{self.gateway_port}"
+        return f"{self.ws_scheme}://{self.gateway_host}{self._port_suffix}{self.gateway_path_prefix}"
 
     def ssl_ctx(self) -> Optional[ssl.SSLContext]:
         """连接 HTTPS 网关时跳过证书验证（自签名证书）。"""

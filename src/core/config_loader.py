@@ -81,6 +81,7 @@ class Config:
     MINICPM_GATEWAY_HOST: str = "localhost"
     MINICPM_GATEWAY_PORT: int = 8006
     MINICPM_GATEWAY_SCHEME: str = "https"
+    MINICPM_GATEWAY_PATH_PREFIX: str = ""
     MINICPM_ASK_ENABLED: bool = True
     MINICPM_ASK_API_KEY: str = ""
     MINICPM_ASK_BASE_URL: str = ""
@@ -195,6 +196,7 @@ class Config:
         instance.MINICPM_GATEWAY_HOST = os.getenv("MINICPM_GATEWAY_HOST", "localhost")
         instance.MINICPM_GATEWAY_PORT = int(os.getenv("MINICPM_GATEWAY_PORT", "8006"))
         instance.MINICPM_GATEWAY_SCHEME = os.getenv("MINICPM_GATEWAY_SCHEME", "https")
+        instance.MINICPM_GATEWAY_PATH_PREFIX = os.getenv("MINICPM_GATEWAY_PATH_PREFIX", "")
         instance.MINICPM_ASK_ENABLED = os.getenv(
             "MINICPM_ASK_ENABLED", "true").lower() in ("true", "1", "yes")
         instance.MINICPM_ASK_API_KEY = os.getenv("MINICPM_ASK_API_KEY", "")
@@ -382,6 +384,7 @@ class Config:
             "gateway_host": instance.MINICPM_GATEWAY_HOST,
             "gateway_port": instance.MINICPM_GATEWAY_PORT,
             "gateway_scheme": instance.MINICPM_GATEWAY_SCHEME,
+            "gateway_path_prefix": instance.MINICPM_GATEWAY_PATH_PREFIX,
             "ask_enabled": instance.MINICPM_ASK_ENABLED,
             "ask_api_key": instance.MINICPM_ASK_API_KEY or instance.OPENAI_API_KEY,
             "ask_base_url": instance.MINICPM_ASK_BASE_URL or instance.OPENAI_BASE_URL,

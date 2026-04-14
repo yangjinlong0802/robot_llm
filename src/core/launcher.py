@@ -15,7 +15,6 @@ import os
 import argparse
 import logging
 
-from ..arm_sdk.controller import RobotController
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -41,7 +40,9 @@ def init_hardware(simulation: bool = False):
 
     # 初始化机械臂
     try:
-        # from ..arm_sdk import RobotController
+        from ..arm_sdk import RobotController
+        if RobotController is None:
+            raise ImportError("RobotController SDK unavailable")
         print("正在初始化机械臂...")
         robot_controller = RobotController()
 
@@ -149,6 +150,11 @@ def main():
     except Exception as e:
         print(f"加载配置失败：{e}，使用默认值")
         run_mode = os.environ.get("RUN_MODE", "server").lower()
+
+    env_run_mode = os.environ.get("RUN_MODE")
+    if env_run_mode:
+        run_mode = env_run_mode.lower()
+        print(f"环境变量覆盖 RUN_MODE={run_mode.upper()}")
 
     # 根据 RUN_MODE 选择运行模式
     if run_mode == "gui":
