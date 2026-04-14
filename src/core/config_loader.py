@@ -30,8 +30,11 @@ class Config:
     SKILL_LIBRARY_PATH: str = "data/skills/skill_library.json"
     
     # RealSense 相机配置
+    CAMERA_PROVIDER: str = "auto"
     REALSENSE_DEVICE_SN: str = ""
     REALSENSE_DEVICE_NAMES: str = ""
+    WEBCAM_DEVICE_INDEXES: str = "0"
+    WEBCAM_DEVICE_NAMES: str = ""
     VISION_CAMERA_HOST: str = "localhost"
     VISION_CAMERA_PORT: int = 12345
     YOLO_MODEL_PATH: str = "models/best.pt"
@@ -143,8 +146,11 @@ class Config:
         instance.RUN_MODE = os.getenv("RUN_MODE", "server")
         instance.SIMULATION_MODE = os.getenv("SIMULATION_MODE", "false").lower() in ("true", "1", "yes")
         instance.SKILL_LIBRARY_PATH = os.getenv("SKILL_LIBRARY_PATH", "data/skills/skill_library.json")
+        instance.CAMERA_PROVIDER = os.getenv("CAMERA_PROVIDER", "auto")
         instance.REALSENSE_DEVICE_SN = os.getenv("REALSENSE_DEVICE_SN", "")
         instance.REALSENSE_DEVICE_NAMES = os.getenv("REALSENSE_DEVICE_NAMES", "")
+        instance.WEBCAM_DEVICE_INDEXES = os.getenv("WEBCAM_DEVICE_INDEXES", "0")
+        instance.WEBCAM_DEVICE_NAMES = os.getenv("WEBCAM_DEVICE_NAMES", "")
 
         # RealSense 相机配置
         instance.VISION_CAMERA_HOST = os.getenv("VISION_CAMERA_HOST", "localhost")
@@ -359,7 +365,9 @@ class Config:
         """获取视觉系统配置"""
         instance = cls.get_instance()
         return {
+            "camera_provider": instance.CAMERA_PROVIDER,
             "camera_sn": instance.REALSENSE_DEVICE_SN,
+            "webcam_indexes": instance.WEBCAM_DEVICE_INDEXES,
             "camera_host": instance.VISION_CAMERA_HOST,
             "camera_port": instance.VISION_CAMERA_PORT,
             "yolo_model_path": instance.YOLO_MODEL_PATH,
