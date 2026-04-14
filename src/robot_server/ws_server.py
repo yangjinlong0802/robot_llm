@@ -1417,7 +1417,9 @@ class RobotWebSocketServer:
                 "configured": self._minicpm_cfg is not None,
                 "gateway": (
                     f"{self._minicpm_cfg.gateway_scheme}://"
-                    f"{self._minicpm_cfg.gateway_host}:{self._minicpm_cfg.gateway_port}"
+                    f"{self._minicpm_cfg.gateway_host}"
+                    f"{self._minicpm_cfg._port_suffix}"
+                    f"{self._minicpm_cfg.gateway_path_prefix}"
                 ) if self._minicpm_cfg else None,
             },
         }))
@@ -1638,10 +1640,11 @@ class RobotWebSocketServer:
             cfg_dict = Config.get_minicpm_proxy_config()
             self._minicpm_cfg = MiniCPMProxyConfig(**cfg_dict)
             logger.info(
-                "MiniCPM 代理已配置: %s://%s:%d",
+                "MiniCPM 代理已配置: %s://%s%s%s",
                 self._minicpm_cfg.gateway_scheme,
                 self._minicpm_cfg.gateway_host,
-                self._minicpm_cfg.gateway_port,
+                self._minicpm_cfg._port_suffix,
+                self._minicpm_cfg.gateway_path_prefix,
             )
         except Exception as exc:
             logger.warning("MiniCPM 代理配置加载失败: %s", exc)
@@ -1666,7 +1669,7 @@ class RobotWebSocketServer:
         await websocket.send(self._json_msg({
             "event": "minicpm_status",
             "configured": True,
-            "gateway": f"{cfg.gateway_scheme}://{cfg.gateway_host}:{cfg.gateway_port}",
+            "gateway": f"{cfg.gateway_scheme}://{cfg.gateway_host}{cfg._port_suffix}{cfg.gateway_path_prefix}",
             "ask_enabled": cfg.ask_enabled,
             "chat_action": "chat_connect / chat / chat_disconnect",
         }))
