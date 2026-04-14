@@ -98,7 +98,7 @@ except ImportError:
 from ..core.models import ActionDefinition, ActionType, SequenceItem, SequenceItemStatus
 from ..core.storage import StorageManager
 from .action_executor import ActionExecutor
-from .camera_manager import RealSenseManager
+from .camera_manager import OpenCVCameraManager, RealSenseManager
 from .minicpm_proxy import MiniCPMProxyConfig, _extract_user_text
 from .interceptor import OutgoingInjector
 from .ask_service import classify_instruction
@@ -343,6 +343,11 @@ class RobotWebSocketServer:
             "save_task":     self._handle_save_task,
             "load_task":     self._handle_load_task,
             "delete_task":   self._handle_delete_task,
+            "get_task_detail": self._handle_get_task_detail,
+            "rename_task": self._handle_rename_task,
+            "add_to_task": self._handle_add_to_task,
+            "remove_from_task": self._handle_remove_from_task,
+            "move_in_task": self._handle_move_in_task,
             # AI 助手
             "ai_chat":       self._handle_ai_chat,
             "ai_confirm":    self._handle_ai_confirm,
@@ -928,6 +933,7 @@ class RobotWebSocketServer:
         }))
         logger.info("任务已加载: %s", task_name)
 
+
     async def _handle_delete_task(self, websocket, data: dict) -> None:
         """
         删除任务文件
@@ -958,6 +964,240 @@ class RobotWebSocketServer:
             "name": task_name,
         }))
         logger.info("任务已删除: %s", task_name)
+
+    async def _handle_get_task_detail(self, websocket, data: dict) -> None:
+        """
+        读取任务文件内容，但不影响当前序列
+        请求: {"action": "get_task_detail", "name": "xxx.task"}
+        """
+        task_name = data.get("name", "").strip()
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        sequence = StorageManager.load_sequence(task_name)
+        if not sequence:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务 '{task_name}' 不存在或为空"}
+            ))
+            return
+
+        for item in sequence:
+            item.status = SequenceItemStatus.PENDING
+
+        await websocket.send(self._json_msg({
+            "event": "task_detail",
+            "name": Path(task_name).with_suffix(".task").name,
+            "sequence": [item.to_dict() for item in sequence],
+        }))
+
+    async def _handle_rename_task(self, websocket, data: dict) -> None:
+        """
+        重命名任务文件
+        请求: {"action": "rename_task", "name": "old.task", "new_name": "new.task"}
+        """
+        task_name = data.get("name", "").strip()
+        new_name = data.get("new_name", "").strip()
+
+        if not task_name or not new_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "name 和 new_name 不能为空"}
+            ))
+            return
+
+        old_path = self._resolve_task_path(task_name)
+        new_path = self._resolve_task_path(new_name)
+
+        if not old_path.is_file():
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务文件 '{task_name}' 不存在"}
+            ))
+            return
+
+        if new_path.is_file() and old_path.resolve() != new_path.resolve():
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务文件 '{new_path.name}' 已存在"}
+            ))
+            return
+
+        old_path.replace(new_path)
+        await websocket.send(self._json_msg({
+            "event": "task_renamed",
+            "name": old_path.name,
+            "new_name": new_path.name,
+        }))
+
+    async def _handle_add_to_task(self, websocket, data: dict) -> None:
+        """
+        直接向任务文件追加/插入动作
+        请求:
+          {"action": "add_to_task", "name": "x.task", "items": [...], "index": 0}
+          {"action": "add_to_task", "name": "x.task", "action_ids": ["..."], "index": 0}
+        """
+        task_name = data.get("name", "").strip()
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        sequence = self._load_task_sequence_for_edit(task_name)
+        if sequence is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务文件 '{task_name}' 不存在"}
+            ))
+            return
+
+        insert_items = []
+        action_ids = data.get("action_ids", [])
+        if action_ids:
+            all_actions = StorageManager.load_actions()
+            action_map = {a.id: a for a in all_actions}
+            for aid in action_ids:
+                if aid not in action_map:
+                    await websocket.send(self._json_msg(
+                        {"event": "error", "message": f"动作库中不存在 id: {aid}"}
+                    ))
+                    return
+                insert_items.append(SequenceItem.from_definition(action_map[aid]))
+
+        items = data.get("items", [])
+        if items:
+            try:
+                insert_items.extend(self._parse_sequence(items))
+            except Exception as e:
+                await websocket.send(self._json_msg(
+                    {"event": "error", "message": f"动作解析失败: {str(e)}"}
+                ))
+                return
+
+        if not insert_items:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "请提供 items 或 action_ids"}
+            ))
+            return
+
+        index = data.get("index")
+        if index is None:
+            sequence.extend(insert_items)
+        else:
+            if not isinstance(index, int) or not (0 <= index <= len(sequence)):
+                await websocket.send(self._json_msg(
+                    {"event": "error", "message": f"无效的插入位置: {index}"}
+                ))
+                return
+            for offset, item in enumerate(insert_items):
+                sequence.insert(index + offset, item)
+
+        StorageManager.save_sequence(sequence, task_name)
+        await websocket.send(self._json_msg({
+            "event": "task_updated",
+            "name": self._resolve_task_path(task_name).name,
+            "sequence": [item.to_dict() for item in sequence],
+        }))
+
+    async def _handle_remove_from_task(self, websocket, data: dict) -> None:
+        """
+        直接删除任务文件中的某一步
+        请求: {"action": "remove_from_task", "name": "x.task", "index": 0}
+        """
+        task_name = data.get("name", "").strip()
+        index = data.get("index")
+
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        sequence = self._load_task_sequence_for_edit(task_name)
+        if sequence is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务文件 '{task_name}' 不存在"}
+            ))
+            return
+
+        if index is None or not isinstance(index, int) or not (0 <= index < len(sequence)):
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"无效的索引: {index}"}
+            ))
+            return
+
+        removed = sequence.pop(index)
+        StorageManager.save_sequence(sequence, task_name)
+        await websocket.send(self._json_msg({
+            "event": "task_updated",
+            "name": self._resolve_task_path(task_name).name,
+            "removed": removed.to_dict(),
+            "sequence": [item.to_dict() for item in sequence],
+        }))
+
+    async def _handle_move_in_task(self, websocket, data: dict) -> None:
+        """
+        直接调整任务文件内部顺序
+        请求: {"action": "move_in_task", "name": "x.task", "from": 0, "to": 1}
+        """
+        task_name = data.get("name", "").strip()
+        from_idx = data.get("from")
+        to_idx = data.get("to")
+
+        if not task_name:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "任务名称不能为空"}
+            ))
+            return
+
+        sequence = self._load_task_sequence_for_edit(task_name)
+        if sequence is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"任务文件 '{task_name}' 不存在"}
+            ))
+            return
+
+        if from_idx is None or to_idx is None:
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "需要提供 from 和 to 索引"}
+            ))
+            return
+
+        if not isinstance(from_idx, int) or not isinstance(to_idx, int):
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": "from 和 to 必须为整数"}
+            ))
+            return
+
+        if not (0 <= from_idx < len(sequence)) or not (0 <= to_idx < len(sequence)):
+            await websocket.send(self._json_msg(
+                {"event": "error", "message": f"索引越界，序列长度: {len(sequence)}"}
+            ))
+            return
+
+        item = sequence.pop(from_idx)
+        sequence.insert(to_idx, item)
+        StorageManager.save_sequence(sequence, task_name)
+        await websocket.send(self._json_msg({
+            "event": "task_updated",
+            "name": self._resolve_task_path(task_name).name,
+            "sequence": [item.to_dict() for item in sequence],
+        }))
+
+    def _resolve_task_path(self, task_name: str) -> Path:
+        name = Path(task_name).name
+        filepath = StorageManager.TASKS_DIR / name
+        if filepath.suffix != ".task":
+            filepath = filepath.with_suffix(".task")
+        return filepath
+
+    def _load_task_sequence_for_edit(self, task_name: str):
+        filepath = self._resolve_task_path(task_name)
+        if not filepath.is_file():
+            return None
+        sequence = StorageManager.load_sequence(filepath.name)
+        for item in sequence:
+            item.status = SequenceItemStatus.PENDING
+        return sequence
 
     # ==================================================================
     # AI 助手
@@ -1190,6 +1430,8 @@ class RobotWebSocketServer:
         def _do_init():
             try:
                 self._broadcast_threadsafe({"event": "log", "message": "正在初始化机械臂..."})
+                if RobotController is None:
+                    raise ImportError("RobotController SDK unavailable")
                 self._robot_controller = RobotController()
 
                 # 初始化 Robot1
@@ -1296,11 +1538,36 @@ class RobotWebSocketServer:
         """
         def _do_test():
             try:
-                import pyrealsense2 as rs
                 from ..core.config_loader import Config
                 import time
 
-                sn = Config.get_instance().REALSENSE_DEVICE_SN
+                config = Config.get_instance()
+                provider = getattr(config, "CAMERA_PROVIDER", "auto").lower()
+                if provider in ("webcam", "opencv"):
+                    import cv2
+
+                    raw_indexes = getattr(config, "WEBCAM_DEVICE_INDEXES", "0")
+                    indexes = [int(x.strip()) for x in raw_indexes.split(",") if x.strip()]
+                    index = indexes[0] if indexes else 0
+                    cap = cv2.VideoCapture(index, getattr(cv2, "CAP_DSHOW", 0))
+                    try:
+                        if not cap.isOpened():
+                            raise RuntimeError(f"本地摄像头无法打开: index={index}")
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            raise RuntimeError(f"本地摄像头无法读取画面: index={index}")
+                        height, width = frame.shape[:2]
+                        self._broadcast_threadsafe({
+                            "event": "camera_test_result",
+                            "success": True,
+                            "message": f"本地摄像头测试成功: index={index} size={width}x{height}",
+                        })
+                    finally:
+                        cap.release()
+                    return
+
+                import pyrealsense2 as rs
+                sn = config.REALSENSE_DEVICE_SN
 
                 ctx = rs.context()
                 devices = list(ctx.devices)
@@ -1419,10 +1686,35 @@ class RobotWebSocketServer:
             from ..core.config_loader import Config
             config = Config.get_instance()
 
+            provider = getattr(config, "CAMERA_PROVIDER", "auto").lower()
             sn_str = getattr(config, "REALSENSE_DEVICE_SN", "")
             names_str = getattr(config, "REALSENSE_DEVICE_NAMES", "")
             serials = [s.strip() for s in sn_str.split(",") if s.strip()] if sn_str else []
             names = [n.strip() for n in names_str.split(",") if n.strip()] if names_str else []
+            webcam_indexes_str = getattr(config, "WEBCAM_DEVICE_INDEXES", "0")
+            webcam_names_str = getattr(config, "WEBCAM_DEVICE_NAMES", "")
+            webcam_indexes = [int(x.strip()) for x in webcam_indexes_str.split(",") if x.strip()]
+            webcam_names = [n.strip() for n in webcam_names_str.split(",") if n.strip()] if webcam_names_str else []
+
+            if provider in ("webcam", "opencv") or (provider == "auto" and not serials):
+                cameras = [
+                    {"index": index, "name": webcam_names[i] if i < len(webcam_names) else f"webcam-{index}"}
+                    for i, index in enumerate(webcam_indexes or [0])
+                ]
+                self._camera_manager = OpenCVCameraManager(
+                    cameras=cameras,
+                    fps=30,
+                    width=640,
+                    height=480,
+                    jpeg_quality=85,
+                )
+                result = self._camera_manager.start()
+                logger.info(
+                    "OpenCV camera manager started: %d online, %d failed",
+                    result["started"], result["failed"],
+                )
+                print(f"OpenCV camera manager started: {result['started']} online, {result['failed']} failed")
+                return
 
             if not serials:
                 logger.info("未配置相机序列号，跳过相机管理器初始化")
