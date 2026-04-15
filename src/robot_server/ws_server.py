@@ -66,14 +66,19 @@ WebSocket 路径:
         {"event": "step_started",       "index": 0, "name": "...", "status": "RUNNING"}
         {"event": "step_completed",     "index": 0, "name": "..."}
         {"event": "step_failed",        "index": 0, "name": "...", "error": "..."}
-        {"event": "log",                "message": "..."}
+        {"event": "log",                "level": "info|warn|error", "message": "..."}
         {"event": "execution_finished"}
-        {"event": "error",              "message": "..."}
+        {"event": "error",              "message": "..."}         # 请求参数校验错误
         {"event": "ai_status_changed",  "status": "分析中..."}
         {"event": "ai_skill_matched",   "skill_id": "...", "skill_name": "...", "params": {...}}
         {"event": "ai_preview_ready",   "sequence": [...], "skill_info": {...}}
         {"event": "ai_execution_finished", "success": true, "message": "..."}
         {"event": "minicpm_instruction", "instruction": "..."}  MiniCPM 检测到机器人指令时推送
+
+    log 事件 level 取值:
+        info  — 常规执行日志（默认）
+        warn  — 可恢复的异常，如重试中
+        error — 执行失败或硬件异常
 
 启动方式:
     python run_server.py
@@ -1441,7 +1446,7 @@ class RobotWebSocketServer:
         """
         def _do_init():
             try:
-                self._broadcast_threadsafe({"event": "log", "message": "正在初始化机械臂..."})
+                self._broadcast_threadsafe({"event": "log", "level": "info", "message": "正在初始化机械臂..."})
                 if RobotController is None:
                     raise ImportError("RobotController SDK unavailable")
                 self._robot_controller = RobotController()
@@ -1450,17 +1455,17 @@ class RobotWebSocketServer:
                 robot1 = self._robot_controller.init_robot1()
                 if robot1 is not None:
                     self._device_status["robot1"] = True
-                    self._broadcast_threadsafe({"event": "log", "message": "Robot1 初始化成功"})
+                    self._broadcast_threadsafe({"event": "log", "level": "info", "message": "Robot1 初始化成功"})
                 else:
-                    self._broadcast_threadsafe({"event": "log", "message": "Robot1 初始化失败"})
+                    self._broadcast_threadsafe({"event": "log", "level": "warn", "message": "Robot1 初始化失败"})
 
                 # 初始化 Robot2
                 robot2 = self._robot_controller.init_robot2()
                 if robot2 is not None:
                     self._device_status["robot2"] = True
-                    self._broadcast_threadsafe({"event": "log", "message": "Robot2 初始化成功"})
+                    self._broadcast_threadsafe({"event": "log", "level": "info", "message": "Robot2 初始化成功"})
                 else:
-                    self._broadcast_threadsafe({"event": "log", "message": "Robot2 初始化失败"})
+                    self._broadcast_threadsafe({"event": "log", "level": "warn", "message": "Robot2 初始化失败"})
 
                 # 更新执行器的控制器引用
                 self._executor._robot_controller = self._robot_controller
@@ -1476,7 +1481,7 @@ class RobotWebSocketServer:
                 self._broadcast_threadsafe({"event": "error", "message": f"机械臂初始化异常: {e}"})
 
         threading.Thread(target=_do_init, daemon=True, name="InitRobots").start()
-        await websocket.send(self._json_msg({"event": "log", "message": "开始初始化机械臂..."}))
+        await websocket.send(self._json_msg({"event": "log", "level": "info", "message": "开始初始化机械臂..."}))
 
     async def _handle_init_body(self, websocket, data: dict) -> None:
         """
@@ -1493,6 +1498,7 @@ class RobotWebSocketServer:
 
             await websocket.send(self._json_msg({
                 "event": "log",
+                "level": "info",
                 "message": "身体控制器初始化成功",
             }))
             await websocket.send(self._json_msg({
@@ -1637,7 +1643,7 @@ class RobotWebSocketServer:
                 })
 
         threading.Thread(target=_do_test, daemon=True, name="TestCamera").start()
-        await websocket.send(self._json_msg({"event": "log", "message": "正在测试相机..."}))
+        await websocket.send(self._json_msg({"event": "log", "level": "info", "message": "正在测试相机..."}))
 
     # ==================================================================
     # MiniCPM 代理
@@ -2051,10 +2057,12 @@ class RobotWebSocketServer:
             "error": error,
         })
 
-    def _on_log(self, message: str) -> None:
-        logger.info(message)
+    def _on_log(self, message: str, level: str = "info") -> None:
+        log_fn = {"warn": logger.warning, "error": logger.error}.get(level, logger.info)
+        log_fn(message)
         self._broadcast_threadsafe({
             "event": "log",
+            "level": level,
             "message": message,
         })
 

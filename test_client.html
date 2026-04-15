@@ -115,6 +115,8 @@
     overflow-y: auto; padding: 4px 8px;
     font-family: Consolas, Monaco, monospace; font-size: 12px; line-height: 1.5;
   }
+  .log-warn  { color: #e65100; }
+  .log-error { color: #c62828; font-weight: bold; }
 
   /* ===== AI 助手 Tab ===== */
   .ai-panel { display: flex; flex-direction: column; height: 100%; padding: 8px; }
@@ -474,8 +476,8 @@ function handleEvent(data) {
   }
 
   // 日志
-  if (ev === 'log') appendLog(data.message);
-  if (ev === 'error') appendLog('[错误] ' + data.message);
+  if (ev === 'log') appendLog(data.message, data.level || 'info');
+  if (ev === 'error') appendLog(data.message, 'error');
 
   // 任务列表
   if (ev === 'tasks_list') renderTaskList(data.tasks || []);
@@ -776,11 +778,13 @@ function resetAIButtons() {
 }
 
 // ===== 日志 =====
-function appendLog(msg) {
+function appendLog(msg, level = 'info') {
   const el = document.getElementById('logArea');
   const now = new Date();
   const ts = now.toTimeString().substring(0, 8);
-  el.innerHTML += `<div>[${ts}] ${msg}</div>`;
+  const cls = level === 'error' ? ' class="log-error"' : level === 'warn' ? ' class="log-warn"' : '';
+  const prefix = level === 'error' ? '[ERR] ' : level === 'warn' ? '[WRN] ' : '';
+  el.innerHTML += `<div${cls}>[${ts}] ${prefix}${msg}</div>`;
   el.scrollTop = el.scrollHeight;
 }
 </script>

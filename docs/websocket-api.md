@@ -243,10 +243,15 @@ const handlers = {
     console.log("状态", data);
   },
   log(data) {
-    console.log("日志", data.message);
+    // level: "info" | "warn" | "error"
+    const fn = data.level === "error" ? console.error
+             : data.level === "warn"  ? console.warn
+             : console.log;
+    fn(`[${data.level}] ${data.message}`);
   },
   error(data) {
-    console.error("错误", data.message);
+    // 请求参数校验错误
+    console.error("请求错误", data.message);
   },
   step_started(data) {
     console.log("步骤开始", data);
@@ -351,8 +356,31 @@ ws.onmessage = (event) => {
 
 | event | 含义 |
 |---|---|
-| `error` | 错误 |
-| `log` | 日志 |
+| `error` | 请求参数校验错误（同步返回给请求方） |
+| `log` | 执行日志（含 `level` 字段） |
+
+`log` 事件结构：
+
+```json
+{
+  "event": "log",
+  "level": "info",
+  "message": "..."
+}
+```
+
+`level` 取值：
+
+| level | 含义 | 前端建议样式 |
+|---|---|---|
+| `info` | 常规执行日志（默认） | 默认色 |
+| `warn` | 可恢复异常，如重试中 | 橙色 |
+| `error` | 执行失败或硬件异常 | 红色加粗 |
+
+注意：`error` **事件**（`event: "error"`）与 `log` 事件中 `level: "error"` 的区别：
+
+- `event: "error"` — 针对当前请求的同步校验错误，如"动作 id 不能为空"
+- `event: "log", level: "error"` — 执行过程中发生的运行时错误，如"机械臂控制器未初始化"
 
 ### 5.2 执行事件
 
@@ -531,6 +559,7 @@ ws.onmessage = (event) => {
 ```json
 {
   "event": "log",
+  "level": "info",
   "message": "开始初始化机械臂..."
 }
 ```
@@ -570,6 +599,7 @@ ws.onmessage = (event) => {
 ```json
 {
   "event": "log",
+  "level": "info",
   "message": "身体控制器初始化成功"
 }
 ```
@@ -627,7 +657,7 @@ ws.onmessage = (event) => {
 
 过程：
 
-1. 先收到 `log`
+1. 先收到 `log`（`level: "info"`）
 2. 再收到 `camera_test_result`
 
 成功示例：
@@ -2094,9 +2124,14 @@ ws.onmessage = (event) => {
     case "actions_list":
       console.log("动作库", data.actions);
       break;
-    case "log":
-      console.log("日志", data.message);
+    case "log": {
+      // level: "info" | "warn" | "error"
+      const fn = data.level === "error" ? console.error
+               : data.level === "warn"  ? console.warn
+               : console.log;
+      fn(`[${data.level}] ${data.message}`);
       break;
+    }
     case "error":
       console.error("错误", data.message);
       break;

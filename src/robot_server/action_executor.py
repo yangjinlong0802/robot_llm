@@ -44,7 +44,7 @@ class ActionExecutor:
         self._on_step_started = on_step_started or (lambda *a: None)
         self._on_step_completed = on_step_completed or (lambda *a: None)
         self._on_step_failed = on_step_failed or (lambda *a: None)
-        self._on_log = on_log or (lambda msg: logger.info(msg))
+        self._on_log = on_log or (lambda msg, level="info": logger.info(msg))
         self._on_finished = on_finished or (lambda: None)
 
         # 控制状态
@@ -158,10 +158,10 @@ class ActionExecutor:
             elif definition.type == ActionType.VISION_CAPTURE:
                 return self._execute_vision_capture(params)
             else:
-                self._on_log(f"未知的动作类型: {definition.type}")
+                self._on_log(f"未知的动作类型: {definition.type}", "error")
                 return False
         except Exception as e:
-            self._on_log(f"执行错误: {str(e)}")
+            self._on_log(f"执行错误: {str(e)}", "error")
             return False
 
     # ------------------------------------------------------------------
@@ -184,7 +184,7 @@ class ActionExecutor:
         self._on_log(f"机械臂移动动作: 臂={arm}, 模式={mode}, 点位={target_pose_str}")
 
         if self._robot_controller is None:
-            self._on_log("机械臂控制器未初始化")
+            self._on_log("机械臂控制器未初始化", "error")
             return False
 
         try:
@@ -196,7 +196,7 @@ class ActionExecutor:
                 elif mode == 'move_l':
                     method = self._robot_controller.move_robot1l
                 else:
-                    self._on_log(f"未知的移动模式: {mode}")
+                    self._on_log(f"未知的移动模式: {mode}", "error")
                     return False
             else:
                 if mode == 'move_j':
@@ -204,7 +204,7 @@ class ActionExecutor:
                 elif mode == 'move_l':
                     method = self._robot_controller.move_robot2l
                 else:
-                    self._on_log(f"未知的移动模式: {mode}")
+                    self._on_log(f"未知的移动模式: {mode}", "error")
                     return False
 
             # 重试机制：处理通信抖动
@@ -214,13 +214,13 @@ class ActionExecutor:
                 if success:
                     self._on_log("机械臂移动执行完成")
                     return True
-                self._on_log(f"机械臂移动失败 (第{attempt}次)，重试中...")
+                self._on_log(f"机械臂移动失败 (第{attempt}次)，重试中...", "warn")
                 time.sleep(0.5)
 
-            self._on_log("机械臂移动重试次数耗尽")
+            self._on_log("机械臂移动重试次数耗尽", "error")
             return False
         except Exception as e:
-            self._on_log(f"执行机械臂移动出错: {str(e)}")
+            self._on_log(f"执行机械臂移动出错: {str(e)}", "error")
             return False
 
     def _execute_body_move(self, params: dict) -> bool:
@@ -230,7 +230,7 @@ class ActionExecutor:
         self._on_log(f"身体移动动作: 目标位置={position}")
 
         if self._body_controller is None:
-            self._on_log("身体控制器未初始化")
+            self._on_log("身体控制器未初始化", "error")
             return False
 
         try:
@@ -244,14 +244,14 @@ class ActionExecutor:
                     return False
                 st = self._body_controller.is_reached()
                 if st is None:
-                    self._on_log("身体通信异常")
+                    self._on_log("身体通信异常", "error")
                     return False
                 if st:
                     self._on_log(f"身体移动完成，位置={position}")
                     return True
                 time.sleep(0.1)
         except Exception as e:
-            self._on_log(f"执行身体移动出错: {str(e)}")
+            self._on_log(f"执行身体移动出错: {str(e)}", "error")
             return False
 
     # ------------------------------------------------------------------
@@ -272,10 +272,10 @@ class ActionExecutor:
                 elif operation == '关':
                     result = kuaihuanshou.send_command('close')
                 else:
-                    self._on_log(f"未知的快换手操作: {operation}")
+                    self._on_log(f"未知的快换手操作: {operation}", "error")
                     return False
                 if result == "error" or result is False:
-                    self._on_log(f"快换手操作失败: {result}")
+                    self._on_log(f"快换手操作失败: {result}", "error")
                     return False
             finally:
                 kuaihuanshou.close()
@@ -290,7 +290,7 @@ class ActionExecutor:
                     elif number == 2:
                         adp.turn_on_relay_Y2()
                     else:
-                        self._on_log(f"未知的编号: {number}")
+                        self._on_log(f"未知的编号: {number}", "error")
                         return False
                 elif operation == '关':
                     if number == 1:
@@ -298,10 +298,10 @@ class ActionExecutor:
                     elif number == 2:
                         adp.turn_off_relay_Y2()
                     else:
-                        self._on_log(f"未知的编号: {number}")
+                        self._on_log(f"未知的编号: {number}", "error")
                         return False
                 else:
-                    self._on_log(f"未知的继电器操作: {operation}")
+                    self._on_log(f"未知的继电器操作: {operation}", "error")
                     return False
             finally:
                 adp.close()
@@ -311,7 +311,7 @@ class ActionExecutor:
         elif executor == '吸液枪':
             return self._execute_pipette(params)
         else:
-            self._on_log(f"未知的执行器: {executor}")
+            self._on_log(f"未知的执行器: {executor}", "error")
             return False
 
         self._on_log(f"执行器: {executor}, 编号: {number}, 操作: {operation}")
@@ -322,7 +322,7 @@ class ActionExecutor:
         self._on_log(f"夹爪动作: {operation}")
 
         if self._robot_controller is None:
-            self._on_log("机械臂控制器未初始化")
+            self._on_log("机械臂控制器未初始化", "error")
             return False
 
         method = (
@@ -338,12 +338,12 @@ class ActionExecutor:
                 if success:
                     self._on_log(f"夹爪{operation}执行完成")
                     return True
-                self._on_log(f"夹爪{operation}失败 (第{attempt}次)，重试中...")
+                self._on_log(f"夹爪{operation}失败 (第{attempt}次)，重试中...", "warn")
             except Exception as e:
-                self._on_log(f"执行夹爪出错: {str(e)} (第{attempt}次)")
+                self._on_log(f"执行夹爪出错: {str(e)} (第{attempt}次)", "warn")
             time.sleep(0.5)
 
-        self._on_log("夹爪重试次数耗尽")
+        self._on_log("夹爪重试次数耗尽", "error")
         return False
 
     def _execute_pipette(self, params: dict) -> bool:
@@ -364,7 +364,7 @@ class ActionExecutor:
                 self._on_log("正在吐液...")
                 ret = adp.dispense_all()
             else:
-                self._on_log(f"未知的吸液枪操作: {operation}")
+                self._on_log(f"未知的吸液枪操作: {operation}", "error")
                 adp.close()
                 return False
 
@@ -373,10 +373,10 @@ class ActionExecutor:
             if ret:
                 self._on_log(f"吸液枪{operation}执行成功")
             else:
-                self._on_log(f"吸液枪{operation}执行失败")
+                self._on_log(f"吸液枪{operation}执行失败", "error")
             return ret
         except Exception as e:
-            self._on_log(f"执行吸液枪出错: {str(e)}")
+            self._on_log(f"执行吸液枪出错: {str(e)}", "error")
             return False
 
     # ------------------------------------------------------------------
@@ -405,7 +405,7 @@ class ActionExecutor:
         self._on_log(f"换枪动作: 枪位={gun_position}, 操作={operation}")
 
         if self._robot_controller is None:
-            self._on_log("机械臂控制器未初始化")
+            self._on_log("机械臂控制器未初始化", "error")
             return False
 
         try:
@@ -418,7 +418,7 @@ class ActionExecutor:
 
             key = (gun_position, operation)
             if key not in method_map:
-                self._on_log(f"未知的换枪参数组合: 枪位={gun_position}, 操作={operation}")
+                self._on_log(f"未知的换枪参数组合: 枪位={gun_position}, 操作={operation}", "error")
                 return False
 
             method_name = method_map[key]
@@ -431,7 +431,7 @@ class ActionExecutor:
                 self._on_log(f"{method_name} 执行完成")
             return success
         except Exception as e:
-            self._on_log(f"执行换枪出错: {str(e)}")
+            self._on_log(f"执行换枪出错: {str(e)}", "error")
             return False
 
     # ------------------------------------------------------------------
@@ -451,7 +451,7 @@ class ActionExecutor:
         self._on_log(f"  置信度={confidence}, 调试图片={debug_images}")
 
         if self._robot_controller is None:
-            self._on_log("机械臂控制器未初始化")
+            self._on_log("机械臂控制器未初始化", "error")
             return False
 
         try:
@@ -471,11 +471,11 @@ class ActionExecutor:
             try:
                 color, depth, intr = grabber.grab(timeout=10)
             except RuntimeError as e:
-                self._on_log(f"相机取帧失败: {e}")
+                self._on_log(f"相机取帧失败: {e}", "error")
                 grabber._cleanup()
                 return False
             except Exception as e:
-                self._on_log(f"RealSense 初始化异常: {type(e).__name__}: {e}")
+                self._on_log(f"RealSense 初始化异常: {type(e).__name__}: {e}", "error")
                 grabber._cleanup()
                 return False
             self._robot_controller.inject_frames(color, depth, intr)
@@ -501,9 +501,9 @@ class ActionExecutor:
                 return True
             else:
                 error = result.get('error', '未知错误')
-                self._on_log(f"视觉抓取执行失败: {error}")
+                self._on_log(f"视觉抓取执行失败: {error}", "error")
                 return False
 
         except Exception as e:
-            self._on_log(f"执行视觉抓取出错: {str(e)}")
+            self._on_log(f"执行视觉抓取出错: {str(e)}", "error")
             return False
