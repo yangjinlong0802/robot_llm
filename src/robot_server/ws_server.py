@@ -1906,7 +1906,7 @@ class RobotWebSocketServer:
     async def _handle_chat_send(self, websocket, data: dict) -> None:
         """发送聊天消息：每次临时连接网关、收完响应后关闭，不影响会话状态。
         请求: {"action": "chat", "messages": [...], "streaming": true, ...}
-        服务端持续推送: {"event": "chat_data", "raw": "..."}
+        服务端持续推送规范化的 chat_data 事件。
         """
         if id(websocket) not in self._minicpm_sessions:
             await websocket.send(self._json_msg({
@@ -1953,16 +1953,56 @@ class RobotWebSocketServer:
         except Exception:
             pass
 
+    @staticmethod
+    def _normalize_chat_data(raw) -> dict:
+        """将 MiniCPM 上游原始消息转换为稳定的 chat_data 结构。"""
+        text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+        try:
+            packet = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return {
+                "event": "chat_data",
+                "type": "unknown",
+                "text": text,
+            }
+
+        packet_type = packet.get("type")
+        if packet_type == "prefill_done":
+            return {
+                "event": "chat_data",
+                "type": "prefill_done",
+                "input_tokens": packet.get("input_tokens"),
+            }
+        if packet_type == "chunk":
+            return {
+                "event": "chat_data",
+                "type": "chunk",
+                "text_delta": packet.get("text_delta", ""),
+            }
+        if packet_type == "done":
+            return {
+                "event": "chat_data",
+                "type": "done",
+                "text": packet.get("text", ""),
+                "generated_tokens": packet.get("generated_tokens"),
+                "input_tokens": packet.get("input_tokens"),
+                "recording_session_id": packet.get("recording_session_id"),
+            }
+
+        return {
+            "event": "chat_data",
+            "type": "unknown",
+            "text": text,
+        }
+
     async def _minicpm_recv_once(self, client_ws, gw_ws) -> None:
         """接收单次 MiniCPM 响应并转发，网关关闭后不改变客户端会话状态。"""
         try:
             async for raw in gw_ws:
                 try:
-                    text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
-                    await client_ws.send(self._json_msg({
-                        "event": "chat_data",
-                        "raw": text,
-                    }))
+                    await client_ws.send(
+                        self._json_msg(self._normalize_chat_data(raw))
+                    )
                 except Exception:
                     break
         except Exception:

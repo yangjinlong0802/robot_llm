@@ -155,8 +155,8 @@ MINICPM_ASK_MODEL=qwen-turbo
 | `MINICPM_GATEWAY_HOST` | MiniCPM 网关主机 | 聊天代理使用 |
 | `MINICPM_GATEWAY_PORT` | MiniCPM 网关端口 | 聊天代理使用 |
 | `MINICPM_GATEWAY_SCHEME` | 网关协议 | `http` 或 `https` |
-| `MINICPM_ASK_ENABLED` | 是否启用指令分类 | 用于识别用户输入是否是机器人指令 |
-| `MINICPM_ASK_API_KEY` | 指令分类模型的 API Key | 留空时回退到 `OPENAI_API_KEY` |
+| `MINICPM_ASK_ENABLED` | 是否启用指令分类 | 仅影响是否触发 `minicpm_instruction` / AI 规划，不影响 MiniCPM 聊天回复 |
+| `MINICPM_ASK_API_KEY` | 指令分类模型的 API Key | 留空时回退到 `OPENAI_API_KEY`；若两者都为空，则跳过分类，不自动规划 |
 | `MINICPM_ASK_BASE_URL` | 指令分类模型 Base URL | 留空时回退到 `OPENAI_BASE_URL` |
 | `MINICPM_ASK_MODEL` | 指令分类模型名 | 如 `qwen-turbo` |
 
@@ -426,6 +426,7 @@ ws.onmessage = (event) => {
 | `ai_status` | AI 当前状态 |
 | `ai_status_changed` | AI 状态变化 |
 | `ai_skill_matched` | 匹配到技能 |
+| `ai_skill_not_matched` | 未能匹配到可执行技能 |
 | `ai_preview_ready` | AI 已生成可执行预览 |
 | `ai_execution_finished` | AI 执行相关流程结束 |
 | `ai_cancelled` | AI 规划已取消 |
@@ -1600,6 +1601,190 @@ ws.onmessage = (event) => {
 - 向前端返回预览序列
 - 由用户决定是否执行
 
+重要说明：
+
+- AI 规划和 `minicpm_instruction` 不是同一个概念。
+- `minicpm_instruction` 只表示“这句话被判定为机器人指令”，不代表任务序列已经生成。
+- 真正的任务序列只会出现在 `ai_preview_ready.sequence` 中。
+- AI 规划依赖 `OPENAI_API_KEY` 对应的 LLM 配置；如果未配置，`ai_chat` 会直接返回 `error`，聊天链路触发时则可能只看到 `minicpm_instruction`，看不到后续规划事件。
+
+### 11.0 AI 规划完整事件流
+
+当前系统存在两条触发入口：
+
+1. 前端主动调用 `ai_chat`
+2. MiniCPM 聊天链路中，服务端在识别到机器人指令后，内部自动调用 AI 规划
+
+这两条入口最终都会走同一套规划核心逻辑，区别只在“入口事件”不同。
+
+#### 11.0.1 前端主动触发路径
+
+前端发送：
+
+```json
+{
+  "action": "ai_chat",
+  "text": "帮我抓一个瓶子"
+}
+```
+
+成功路径的典型事件顺序如下：
+
+1. `ai_status_changed`
+2. `ai_skill_matched`
+3. `ai_preview_ready`
+4. `ai_status_changed`
+
+也就是：
+
+```json
+{
+  "event": "ai_status_changed",
+  "status": "分析中..."
+}
+```
+
+```json
+{
+  "event": "ai_skill_matched",
+  "skill_id": "grab_bottle",
+  "skill_name": "抓取瓶子",
+  "confidence": 0.91,
+  "params": {},
+  "reasoning": "用户表达的是抓取瓶子的动作意图。"
+}
+```
+
+```json
+{
+  "event": "ai_preview_ready",
+  "sequence": [
+    {
+      "uuid": "seq-item-id",
+      "definition": {
+        "id": "action-id",
+        "name": "pingzishang",
+        "type": "MOVE",
+        "parameters": {
+          "臂": "左",
+          "模式": "move_l",
+          "点位": "[0.068791,-0.011241,-0.423676,-3.107000,0.000000,1.603000]"
+        }
+      },
+      "status": "PENDING"
+    }
+  ],
+  "skill_info": {
+    "id": "grab_bottle",
+    "name": "抓取瓶子"
+  }
+}
+```
+
+```json
+{
+  "event": "ai_status_changed",
+  "status": "预览就绪"
+}
+```
+
+说明：
+
+- `ai_chat` 没有单独的“提交成功”响应包；前端要把后续收到的事件流当作这次请求的结果。
+- `ai_preview_ready.sequence` 才是最终给前端展示、确认、执行的任务序列。
+- `ai_preview_ready` 到来前，前端不应认为规划已经成功。
+
+#### 11.0.2 MiniCPM 聊天触发路径
+
+当用户在聊天中输入一句话后，可能先收到：
+
+```json
+{
+  "event": "minicpm_instruction",
+  "instruction": "帮我抓一个瓶子"
+}
+```
+
+这一步只表示 Ask 分类器认定该输入属于机器人指令。随后如果 AI 规划组件可用，服务端会继续广播与 `ai_chat` 相同的规划事件流：
+
+1. `ai_status_changed`
+2. `ai_skill_matched`
+3. `ai_preview_ready`
+4. `ai_status_changed`
+
+重要区别：
+
+- `minicpm_instruction.instruction` 只是规范化后的指令文本，不是任务序列。
+- 前端不要把 `instruction` 当成 `sequence` 使用。
+- 前端要等待 `ai_preview_ready.sequence`，而不是看到 `minicpm_instruction` 就直接执行。
+- 如果聊天链路只收到了 `minicpm_instruction`，但一直没有后续 `ai_status_changed` / `ai_preview_ready`，通常表示 AI 规划当前不可用、正在忙、或未满足启动条件。
+
+#### 11.0.3 匹配失败路径
+
+如果模型无法将输入匹配到当前技能库中的某个技能，通常会收到：
+
+1. `ai_status_changed(status = "分析中...")`
+2. `ai_skill_not_matched`
+3. `ai_status_changed(status = "匹配失败")`
+
+示例：
+
+```json
+{
+  "event": "ai_skill_not_matched",
+  "error": "无法理解您的意图（置信度过低）"
+}
+```
+
+此时前端应：
+
+- 停止 loading 状态
+- 向用户展示未匹配原因
+- 不要展示“确认执行”按钮
+
+#### 11.0.4 硬错误路径
+
+若请求参数非法、LLM 不可用、或规划内部发生异常，服务端会发送：
+
+```json
+{
+  "event": "error",
+  "message": "LLM 不可用，请检查 config.env 中的 API Key 配置"
+}
+```
+
+常见触发场景：
+
+- `ai_chat.text` 为空
+- 当前已有一轮 AI 规划正在处理中
+- `OPENAI_API_KEY` 未配置，导致 LLM 客户端不可用
+- 技能引擎未初始化
+- 规划展开或校验失败
+
+#### 11.0.5 前端状态机建议
+
+建议前端把 AI 规划分成 5 个本地状态：
+
+- `idle`：空闲，尚未发起规划
+- `planning`：已发起规划，等待模型分析
+- `matched`：已匹配技能，但尚未拿到可执行预览
+- `preview_ready`：已拿到 `ai_preview_ready.sequence`，等待用户确认
+- `executing`：用户已确认，正在执行动作序列
+
+推荐状态迁移：
+
+- 发送 `ai_chat` 后进入 `planning`
+- 收到 `ai_skill_matched` 后进入 `matched`
+- 收到 `ai_preview_ready` 后进入 `preview_ready`
+- 收到 `ai_confirm` 对应的 `accepted` 后进入 `executing`
+- 收到 `ai_skill_not_matched`、`error`、`ai_cancelled`、`ai_execution_finished` 后，根据场景退回 `idle`
+
+前端务必区分三类数据：
+
+- `minicpm_instruction`：指令识别通知
+- `ai_preview_ready.sequence`：待确认的任务序列
+- `step_started` / `step_completed` / `step_failed`：执行阶段的进度事件
+
 ### 11.1 发起 AI 规划 `ai_chat`
 
 请求：
@@ -1618,6 +1803,13 @@ ws.onmessage = (event) => {
 | `action` | `string` | 是 | 固定值 `ai_chat` |
 | `text` | `string` | 是 | 自然语言输入 |
 
+前置条件：
+
+- 服务端已正确初始化 LLM 客户端
+- `OPENAI_API_KEY` 已配置且可用
+- 当前没有另一轮 AI 规划正在处理中
+- 技能引擎已成功加载
+
 典型事件流：
 
 #### 1. 进入处理中
@@ -1625,7 +1817,7 @@ ws.onmessage = (event) => {
 ```json
 {
   "event": "ai_status_changed",
-  "status": "分析中"
+  "status": "分析中..."
 }
 ```
 
@@ -1636,7 +1828,9 @@ ws.onmessage = (event) => {
   "event": "ai_skill_matched",
   "skill_id": "skill-id",
   "skill_name": "抓取瓶子",
-  "params": {}
+  "confidence": 0.91,
+  "params": {},
+  "reasoning": "用户表达的是抓取瓶子的动作意图。"
 }
 ```
 
@@ -1650,10 +1844,22 @@ ws.onmessage = (event) => {
 }
 ```
 
+#### 4. 预览已就绪
+
+```json
+{
+  "event": "ai_status_changed",
+  "status": "预览就绪"
+}
+```
+
 说明：
 
 - `ai_chat` 只负责规划，不直接执行
 - 真正执行要靠 `ai_confirm`
+- `sequence` 会写入服务端的“AI 待确认预览区”，但此时还不会覆盖当前执行序列
+- 前端应以 `ai_preview_ready.sequence` 作为唯一权威预览数据源
+- 如果收到 `ai_skill_not_matched` 或 `error`，则视为本轮规划失败
 
 ### 11.2 确认执行 AI 规划 `ai_confirm`
 
@@ -1670,7 +1876,40 @@ ws.onmessage = (event) => {
 - 将最近一次 AI 预览结果写入当前序列
 - 立即开始执行
 
-后续事件与 `execute` 基本一致。
+成功后典型事件流：
+
+1. `accepted`
+2. `step_started`
+3. `step_completed` 或 `step_failed`
+4. `ai_execution_finished`
+5. `execution_finished`
+
+接受示例：
+
+```json
+{
+  "event": "accepted",
+  "message": "AI 序列开始执行",
+  "steps": 4
+}
+```
+
+AI 执行流程结束示例：
+
+```json
+{
+  "event": "ai_execution_finished",
+  "success": true,
+  "message": "AI 序列执行完成"
+}
+```
+
+说明：
+
+- `ai_confirm` 只能确认“最近一次尚未取消的 AI 预览序列”。
+- 如果当前没有待确认预览，服务端会返回 `error`。
+- `ai_confirm` 成功后，预览缓存会被清空。
+- 执行进度事件与普通 `execute` 共用同一套 `step_started` / `step_completed` / `step_failed` / `execution_finished`。
 
 ### 11.3 取消 AI 规划 `ai_cancel`
 
@@ -1690,6 +1929,12 @@ ws.onmessage = (event) => {
   "message": "AI 规划已取消"
 }
 ```
+
+说明：
+
+- `ai_cancel` 只会清空最近一次待确认的 AI 预览结果。
+- 它不会终止已经开始执行的动作序列。
+- 取消后，前端应清空本地的 AI 预览面板和“确认执行”按钮状态。
 
 ### 11.4 查询 AI 状态 `ai_status`
 
@@ -1725,6 +1970,13 @@ ws.onmessage = (event) => {
 | `provider` | `string` | 提供商 |
 | `processing` | `boolean` | 是否正在处理中 |
 | `has_preview` | `boolean` | 是否存在待确认预览 |
+
+推荐用途：
+
+- 页面初始化时先调用一次，判断当前 AI 功能是否可用
+- 若 `processing = true`，前端应避免重复发起 `ai_chat`
+- 若 `has_preview = true`，前端可恢复上一次未确认的 AI 预览面板
+- 若 `llm_available = false` 或 `api_key_set = false`，前端应明确提示“当前只支持聊天/普通控制，不支持 AI 规划”
 
 ### 11.5 查询技能列表 `list_skills`
 
@@ -1975,14 +2227,116 @@ function toImageSrc(frame) {
 ```json
 {
   "event": "chat_data",
-  "raw": "{...gateway payload...}"
+  "type": "prefill_done",
+  "input_tokens": 151
 }
 ```
 
-注意：
+```json
+{
+  "event": "chat_data",
+  "type": "chunk",
+  "text_delta": "这是摄像头的视角范围。"
+}
+```
 
-- `raw` 是上游网关的原始文本
-- 前端需要根据上游协议自行解析
+```json
+{
+  "event": "chat_data",
+  "type": "done",
+  "text": "这是摄像头的视角范围。",
+  "generated_tokens": 1,
+  "input_tokens": 151,
+  "recording_session_id": "chat_xxx"
+}
+```
+
+```json
+{
+  "event": "chat_data",
+  "type": "unknown",
+  "text": "{...gateway payload...}"
+}
+```
+
+字段说明：
+
+- `type = prefill_done`：上游已完成预填充，通常可忽略
+- `type = chunk`：流式增量文本，前端应持续拼接 `text_delta`
+- `type = done`：单轮回复结束，`text` 为最终完整文本
+- `type = unknown`：后端无法识别的上游包，原始文本放在 `text` 中
+
+前端接收后的推荐处理流程：
+
+1. 收到用户发送动作后，先在本地聊天列表插入一条用户消息。
+2. 同时创建一条“助手占位消息”，初始内容为空，状态建议标记为 `streaming`。
+3. 发送 `chat` 请求后，前端开始等待 `event = chat_data` 的消息流。
+4. 收到 `type = prefill_done` 时，不需要渲染正文；如需展示调试信息，可记录 `input_tokens`。
+5. 收到 `type = chunk` 时，将 `text_delta` 追加到当前这条助手占位消息中，并立即刷新界面，形成打字机效果。
+6. 收到 `type = done` 时，将当前这条助手消息状态改为 `done`，并用 `text` 作为最终权威文本；如果前面已经累积过若干 `chunk`，仍建议以 `done.text` 为最终落库内容。
+7. 收到 `type = unknown` 时，不要再尝试 `JSON.parse`；应把 `text` 当作普通原始文本处理，可展示到调试面板，或作为兜底文本显示。
+8. 收到 `event = error` 时，应把当前助手占位消息标记为失败，并将错误信息展示给用户。
+9. 页面关闭、切换会话、或确认不再继续聊天时，再调用 `chat_disconnect` 释放聊天会话。
+
+前端状态管理建议：
+
+- 当前协议的 `chat_data` 不带 `request_id`，因此同一个连接上，建议一轮回复结束前不要并发发送多条 `chat` 请求。
+- 最稳妥的做法是：上一轮收到 `type = done` 或 `event = error` 之前，发送按钮置灰，或由前端本地排队串行发送。
+- 前端不应再依赖旧版 `data.raw` 字段；当前版本应只按 `event = chat_data` 和 `type` 分发逻辑。
+- 如果需要统计本轮 token 或会话编号，可在 `done` 事件中读取 `generated_tokens`、`input_tokens`、`recording_session_id`。
+
+推荐的前端分发伪代码：
+
+```javascript
+let currentAssistantMessageId = null;
+let currentStreamText = "";
+
+function handleChatData(data) {
+  switch (data.type) {
+    case "prefill_done":
+      updateChatMeta({ inputTokens: data.input_tokens });
+      break;
+
+    case "chunk":
+      if (!currentAssistantMessageId) {
+        currentAssistantMessageId = createAssistantMessage({ text: "", status: "streaming" });
+        currentStreamText = "";
+      }
+      currentStreamText += data.text_delta || "";
+      updateMessage(currentAssistantMessageId, {
+        text: currentStreamText,
+        status: "streaming"
+      });
+      break;
+
+    case "done":
+      if (!currentAssistantMessageId) {
+        currentAssistantMessageId = createAssistantMessage({ text: "", status: "streaming" });
+      }
+      updateMessage(currentAssistantMessageId, {
+        text: data.text || currentStreamText,
+        status: "done",
+        generatedTokens: data.generated_tokens,
+        inputTokens: data.input_tokens,
+        recordingSessionId: data.recording_session_id
+      });
+      currentAssistantMessageId = null;
+      currentStreamText = "";
+      break;
+
+    case "unknown":
+      appendDebugLog(data.text);
+      break;
+  }
+}
+```
+
+补充说明：
+
+- `chunk` 负责流式展示，`done` 负责最终收口，两者不是二选一，而是一前一后配合使用。
+- 如果本轮完全没有收到 `chunk`，前端仍应能只依赖 `done.text` 完成展示。
+- 如果收到了若干 `chunk`，但 `done.text` 与累计文本有差异，应优先信任 `done.text`，因为它代表后端确认后的完整结果。
+- `unknown` 主要用于兼容未来上游协议变化，正常页面可以不展示给普通用户，但建议保留调试入口。
 
 ### 13.4 指令识别事件 `minicpm_instruction`
 
@@ -1994,6 +2348,14 @@ function toImageSrc(frame) {
   "instruction": "帮我抓一个瓶子"
 }
 ```
+
+补充说明：
+
+- 该事件依赖 `MINICPM_ASK_ENABLED=true` 且存在可用的 Ask 分类 API Key
+- 若 `MINICPM_ASK_API_KEY` 和 `OPENAI_API_KEY` 都未配置，则不会自动触发该事件
+- 普通聊天回复仍会通过 `chat_data` 返回，与是否触发指令规划无关
+- `minicpm_instruction` 不是聊天正文，它只是“该输入被判定为机器人指令”的附加通知事件
+- 前端不要把 `minicpm_instruction.instruction` 当成机器人回复文本渲染到聊天气泡中
 
 适合的前端处理方式：
 
@@ -2048,11 +2410,15 @@ function toImageSrc(frame) {
 
 推荐流程：
 
-1. 调用 `ai_chat`
-2. 等待 `ai_preview_ready`
-3. 展示规划结果
-4. 用户确认后调用 `ai_confirm`
-5. 用户取消则调用 `ai_cancel`
+1. 页面初始化时先调用 `ai_status`，确认 `llm_available`、`api_key_set`、`processing`、`has_preview`
+2. 用户输入自然语言后调用 `ai_chat`
+3. 收到 `ai_status_changed(status = "分析中...")` 后进入 loading 状态
+4. 收到 `ai_skill_matched` 后展示“已匹配技能”和参数摘要
+5. 收到 `ai_preview_ready` 后展示任务序列预览，并启用“确认执行”按钮
+6. 若收到 `ai_skill_not_matched` 或 `error`，则结束本轮规划并给出失败提示
+7. 用户确认后调用 `ai_confirm`
+8. 执行阶段继续监听 `accepted`、`step_started`、`step_completed`、`step_failed`、`ai_execution_finished`、`execution_finished`
+9. 用户取消预览则调用 `ai_cancel`
 
 ### 14.4 相机预览页面
 
@@ -2069,9 +2435,13 @@ function toImageSrc(frame) {
 
 1. 调用 `minicpm_status`
 2. 调用 `chat_connect`
-3. 调用 `chat`
-4. 监听 `chat_data`
-5. 不再使用时调用 `chat_disconnect`
+3. 用户发送消息时，先在本地插入用户气泡，再创建一条空的助手占位气泡
+4. 调用 `chat`
+5. 监听 `chat_data`
+6. 对 `prefill_done`、`chunk`、`done`、`unknown` 按协议分别处理
+7. 只有收到 `done` 或 `error` 后，才允许开始下一轮发送
+8. 若同时收到 `minicpm_instruction`，应将其视为“指令识别提示”或“规划入口”，不要当聊天正文显示
+9. 不再使用时调用 `chat_disconnect`
 
 ---
 
