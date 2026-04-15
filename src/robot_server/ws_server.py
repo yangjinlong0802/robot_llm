@@ -52,15 +52,12 @@ WebSocket 服务端
 
     === MiniCPM 聊天代理 ===
         {"action": "minicpm_status"}                       查询 MiniCPM 网关配置与代理状态
+        {"action": "chat_connect"}                         建立聊天会话（标记当前连接进入聊天模式）
+        {"action": "chat",         "messages": [...]}      发送聊天消息（每次临时连接网关，收完响应后关闭）
+        {"action": "chat_disconnect"}                      断开聊天会话
 
 WebSocket 路径:
-    ws://{host}:{port}/               — 前端主控连接（本协议）
-    ws://{host}:{port}/camera/stream  — 拼接 JPEG 流（二进制帧，30fps）
-    ws://{host}:{port}/camera/frames  — 每路相机独立帧
-                                        {"frames": [{"camera_id":"...", "index":0, "data":"<base64>"}]}
-    ws://{host}:{port}/ws/chat        — 透明代理到 MiniCPM 网关（聊天模式，注入系统提示 + 指令检测）
-    ws://{host}:{port}/ws/duplex/*    — 透明代理到 MiniCPM 网关（全双工音视频模式）
-    ws://{host}:{port}/ws/half_duplex/* — 透明代理到 MiniCPM 网关（半双工音频模式）
+    ws://{host}:{port}/               — 前端主控连接（本协议，所有功能均通过 action 字段分发）
 
     服务端 → 前端（事件推送）:
         {"event": "step_started",       "index": 0, "name": "...", "status": "RUNNING"}
@@ -68,12 +65,15 @@ WebSocket 路径:
         {"event": "step_failed",        "index": 0, "name": "...", "error": "..."}
         {"event": "log",                "level": "info|warn|error", "message": "..."}
         {"event": "execution_finished"}
-        {"event": "error",              "message": "..."}         # 请求参数校验错误
+        {"event": "error",              "message": "..."}              # 请求参数校验错误
         {"event": "ai_status_changed",  "status": "分析中..."}
         {"event": "ai_skill_matched",   "skill_id": "...", "skill_name": "...", "params": {...}}
         {"event": "ai_preview_ready",   "sequence": [...], "skill_info": {...}}
         {"event": "ai_execution_finished", "success": true, "message": "..."}
-        {"event": "minicpm_instruction", "instruction": "..."}  MiniCPM 检测到机器人指令时推送
+        {"event": "chat_connected"}                                    # 聊天会话已建立
+        {"event": "chat_disconnected"}                                 # 聊天会话已断开
+        {"event": "chat_data",          "raw": "..."}                  # MiniCPM 聊天响应（每条上游帧推送一次，raw 为原始文本）
+        {"event": "minicpm_instruction","instruction": "..."}          # 检测到可执行机器人指令
 
     log 事件 level 取值:
         info  — 常规执行日志（默认）

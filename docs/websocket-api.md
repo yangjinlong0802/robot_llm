@@ -451,8 +451,25 @@ ws.onmessage = (event) => {
 | `minicpm_status` | MiniCPM 代理状态 |
 | `chat_connected` | 聊天会话已建立 |
 | `chat_disconnected` | 聊天会话已关闭 |
-| `chat_data` | 聊天数据流 |
+| `chat_data` | MiniCPM 聊天响应（每条上游帧推送一次） |
 | `minicpm_instruction` | 检测到机器人可执行指令 |
+
+`chat_data` 事件结构：
+
+```json
+{
+  "event": "chat_data",
+  "raw": "{...gateway payload...}"
+}
+```
+
+字段说明：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `raw` | `string` | 上游 MiniCPM 网关的原始文本，前端需根据网关协议自行解析 |
+
+注意：每条上游帧对应一次 `chat_data` 推送，流式响应时会收到多条。
 
 ---
 
