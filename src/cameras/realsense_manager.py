@@ -9,14 +9,14 @@
 并通过 get_cameras_info() 报告各相机状态。
 """
 
-import asyncio
-import base64
-import json
 import logging
 import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_instance: Optional["RealSenseManager"] = None
+_instance_lock = threading.Lock()
 
 try:
     import numpy as np
@@ -75,11 +75,34 @@ class RealSenseManager:
         self._failed_cameras: list[dict] = []
 
         self._running = False
-        self._thread: Optional[threading.Thread] = None
+        # 每路相机独立采集线程 + 独立编码线程
+        self._cam_threads: list[threading.Thread] = []
+        self._encode_thread: Optional[threading.Thread] = None
+        # 各相机最新原始帧: serial -> (name, ndarray)，由采集线程写入
+        self._raw_frames: dict[str, tuple[str, "np.ndarray"]] = {}
+        self._raw_lock = threading.Lock()
+        # 编码结果，由编码线程写入，外部只读
         self._lock = threading.Lock()
         self._latest_jpeg: Optional[bytes] = None
         # (serial, name, jpeg_bytes)
         self._latest_jpegs: list[tuple[str, str, bytes]] = []
+
+    @classmethod
+    def get_instance(cls, **kwargs) -> "RealSenseManager":
+        """返回全局单例。首次调用时以 kwargs 初始化，后续调用忽略参数直接返回已有实例。"""
+        global _instance
+        if _instance is None:
+            with _instance_lock:
+                if _instance is None:
+                    _instance = cls(**kwargs)
+        return _instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """销毁单例（测试或重新配置时使用）。调用前请先手动 stop()。"""
+        global _instance
+        with _instance_lock:
+            _instance = None
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -158,8 +181,20 @@ class RealSenseManager:
 
         if self._pipelines:
             self._running = True
-            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-            self._thread.start()
+            self._raw_frames.clear()
+            for serial, name, pipeline in self._pipelines:
+                t = threading.Thread(
+                    target=self._camera_capture_loop,
+                    args=(serial, name, pipeline),
+                    daemon=True,
+                    name=f"rs-capture-{name}",
+                )
+                t.start()
+                self._cam_threads.append(t)
+            self._encode_thread = threading.Thread(
+                target=self._encode_loop, daemon=True, name="rs-encode"
+            )
+            self._encode_thread.start()
             logger.info(
                 "相机采集线程已启动: %d 路在线, %d 路失败",
                 len(self._pipelines), len(self._failed_cameras),
@@ -173,8 +208,12 @@ class RealSenseManager:
 
     def stop(self) -> None:
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=3.0)
+        for t in self._cam_threads:
+            t.join(timeout=3.0)
+        if self._encode_thread:
+            self._encode_thread.join(timeout=3.0)
+        self._cam_threads.clear()
+        self._encode_thread = None
         for serial, name, pipeline in self._pipelines:
             try:
                 pipeline.stop()
@@ -220,29 +259,33 @@ class RealSenseManager:
     # 内部实现
     # ------------------------------------------------------------------
 
-    def _capture_loop(self) -> None:
+    def _camera_capture_loop(self, serial: str, name: str, pipeline: "rs.pipeline") -> None:
+        """每路相机独立线程：持续采集原始帧，写入 _raw_frames。"""
         while self._running:
-            raw_frames = self._grab_raw_frames()
-            if not raw_frames:
-                continue
-            jpeg = self._encode_stitched(raw_frames)
-            individual = self._encode_individual(raw_frames)
-            with self._lock:
-                if jpeg is not None:
-                    self._latest_jpeg = jpeg
-                self._latest_jpegs = individual
-
-    def _grab_raw_frames(self) -> list[tuple[str, str, "np.ndarray"]]:
-        frames = []
-        for serial, name, pipeline in self._pipelines:
             try:
                 frameset = pipeline.wait_for_frames(timeout_ms=200)
                 color = frameset.get_color_frame()
                 if color:
-                    frames.append((serial, name, np.asanyarray(color.get_data())))
+                    arr = np.asanyarray(color.get_data())
+                    with self._raw_lock:
+                        self._raw_frames[serial] = (name, arr)
             except Exception as exc:
                 logger.debug("帧超时 %s (%s): %s", name, serial, exc)
-        return frames
+
+    def _encode_loop(self) -> None:
+        """编码线程：读取所有相机最新原始帧，编码为 JPEG 写入公开缓冲区。"""
+        interval = 1.0 / max(self._fps, 1)
+        while self._running:
+            with self._raw_lock:
+                snapshot = [(serial, name, arr) for serial, (name, arr) in self._raw_frames.items()]
+            if snapshot:
+                jpeg = self._encode_stitched(snapshot)
+                individual = self._encode_individual(snapshot)
+                with self._lock:
+                    if jpeg is not None:
+                        self._latest_jpeg = jpeg
+                    self._latest_jpegs = individual
+            threading.Event().wait(interval)
 
     def _encode_individual(
         self, raw_frames: list[tuple[str, str, "np.ndarray"]]
@@ -296,137 +339,3 @@ class RealSenseManager:
             ".jpg", stitched, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
         )
         return bytes(buf) if ok else None
-
-
-class OpenCVCameraManager:
-    """Manage one or more local webcams through OpenCV."""
-
-    def __init__(
-        self,
-        cameras: list[dict] = (),
-        fps: int = 30,
-        width: int = 640,
-        height: int = 480,
-        jpeg_quality: int = 85,
-        backend: Optional[int] = None,
-    ) -> None:
-        self._cameras: list[dict] = [
-            {
-                "index": int(c.get("index", 0)),
-                "name": c.get("name", "") or f"webcam-{int(c.get('index', 0))}",
-            }
-            for c in cameras
-        ]
-        self._fps = fps
-        self._width = width
-        self._height = height
-        self._jpeg_quality = jpeg_quality
-        self._backend = backend if backend is not None else getattr(cv2, "CAP_DSHOW", 0)
-
-        self._captures: list[tuple[int, str, "cv2.VideoCapture"]] = []
-        self._failed_cameras: list[dict] = []
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self._latest_jpegs: list[tuple[str, str, bytes]] = []
-
-    @property
-    def is_available(self) -> bool:
-        return _CV_AVAILABLE
-
-    @property
-    def camera_count(self) -> int:
-        return len(self._captures)
-
-    @property
-    def is_running(self) -> bool:
-        return self._running
-
-    def start(self) -> dict:
-        if not _CV_AVAILABLE:
-            raise RuntimeError("opencv-python 未安装")
-
-        self._captures.clear()
-        self._failed_cameras.clear()
-
-        for cam in self._cameras:
-            index = cam["index"]
-            name = cam["name"]
-            capture = cv2.VideoCapture(index, self._backend)
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, self._width)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self._height)
-            capture.set(cv2.CAP_PROP_FPS, self._fps)
-
-            if not capture.isOpened():
-                self._failed_cameras.append(
-                    {"serial": f"webcam:{index}", "name": name, "error": "摄像头无法打开"}
-                )
-                capture.release()
-                continue
-
-            ok, _ = capture.read()
-            if not ok:
-                self._failed_cameras.append(
-                    {"serial": f"webcam:{index}", "name": name, "error": "摄像头无法读取画面"}
-                )
-                capture.release()
-                continue
-
-            self._captures.append((index, name, capture))
-
-        if self._captures:
-            self._running = True
-            self._thread = threading.Thread(target=self._capture_loop, daemon=True)
-            self._thread.start()
-        else:
-            logger.warning("所有本地摄像头均无法启动 (%d 路失败)", len(self._failed_cameras))
-
-        return {"started": len(self._captures), "failed": len(self._failed_cameras)}
-
-    def stop(self) -> None:
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=3.0)
-        for _, _, capture in self._captures:
-            try:
-                capture.release()
-            except Exception:
-                pass
-        self._captures.clear()
-
-    def get_latest_jpeg(self) -> Optional[bytes]:
-        with self._lock:
-            return self._latest_jpegs[0][2] if self._latest_jpegs else None
-
-    def get_latest_jpegs(self) -> list[tuple[str, str, bytes]]:
-        with self._lock:
-            return list(self._latest_jpegs)
-
-    def get_cameras_info(self) -> list[dict]:
-        online = {index for index, _, _ in self._captures}
-        failed_map = {c["serial"]: c["error"] for c in self._failed_cameras}
-        result = []
-        for cam in self._cameras:
-            serial = f"webcam:{cam['index']}"
-            item = {"serial": serial, "name": cam["name"], "online": cam["index"] in online}
-            if cam["index"] not in online:
-                item["error"] = failed_map.get(serial, "未启动")
-            result.append(item)
-        return result
-
-    def _capture_loop(self) -> None:
-        interval = 1.0 / max(self._fps, 1)
-        while self._running:
-            frames: list[tuple[str, str, bytes]] = []
-            for index, name, capture in self._captures:
-                ok, frame = capture.read()
-                if not ok or frame is None:
-                    continue
-                ok, buf = cv2.imencode(
-                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self._jpeg_quality]
-                )
-                if ok:
-                    frames.append((f"webcam:{index}", name, bytes(buf)))
-            with self._lock:
-                self._latest_jpegs = frames
-            threading.Event().wait(interval)

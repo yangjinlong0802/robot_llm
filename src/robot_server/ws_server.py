@@ -100,14 +100,18 @@ try:
 except ImportError:
     websockets = None
 
-from ..core.models import ActionDefinition, ActionType, SequenceItem, SequenceItemStatus
-from ..core.storage import StorageManager
+from src.cameras import get_camera_manager
+from src.cameras.camera_factory import CameraManager
 from .action_executor import ActionExecutor
-from .camera_manager import OpenCVCameraManager, RealSenseManager
 from .minicpm_proxy import MiniCPMProxyConfig, _extract_user_text
 from .interceptor import OutgoingInjector
 from .ask_service import classify_instruction
+from ..core.models import ActionDefinition, ActionType, SequenceItem, SequenceItemStatus
+from ..core.storage import StorageManager
+from ..core.config_loader import Config
 from ..arm_sdk import RobotController
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +178,7 @@ class RobotWebSocketServer:
             self._device_status["robot2"] = True
 
         # RealSense 相机管理器（可选，延迟初始化）
-        self._camera_manager: Optional[RealSenseManager] = None
+        self._camera_manager: Optional[CameraManager] = None
 
         # 相机帧订阅：通过 subscribe_camera_frames action 注册
         self._camera_frame_subs: Set = set()
@@ -216,7 +220,7 @@ class RobotWebSocketServer:
         # 初始化 AI 组件
         self._init_ai()
 
-        # 启动相机管理器（可选，graceful degradation）
+        # 启动相机管理器
         self._init_camera()
 
         # 加载 MiniCPM 代理配置
@@ -235,7 +239,6 @@ class RobotWebSocketServer:
     def _init_ai(self) -> None:
         """初始化 LLM 客户端和技能引擎"""
         try:
-            from ..core.config_loader import Config
             config = Config.get_instance()
 
             # 初始化技能引擎
@@ -1301,7 +1304,6 @@ class RobotWebSocketServer:
         model_name = self._llm_client.get_model_name() if self._llm_client else "未配置"
 
         try:
-            from ..core.config_loader import Config
             config = Config.get_instance()
             provider = config.MODEL_PROVIDER.upper()
             api_key_set = bool(config.OPENAI_API_KEY)
@@ -1556,7 +1558,6 @@ class RobotWebSocketServer:
         """
         def _do_test():
             try:
-                from ..core.config_loader import Config
                 import time
 
                 config = Config.get_instance()
@@ -1652,7 +1653,6 @@ class RobotWebSocketServer:
     def _init_minicpm_config(self) -> None:
         """从 Config 加载 MiniCPM 代理配置。"""
         try:
-            from ..core.config_loader import Config
             cfg_dict = Config.get_minicpm_proxy_config()
             self._minicpm_cfg = MiniCPMProxyConfig(**cfg_dict)
             logger.info(
@@ -1695,72 +1695,8 @@ class RobotWebSocketServer:
     # ==================================================================
 
     def _init_camera(self) -> None:
-        """启动 RealSense 相机管理器（graceful degradation）。
-
-        相机列表由配置决定：REALSENSE_DEVICE_SN（逗号分隔序列号）+
-        REALSENSE_DEVICE_NAMES（逗号分隔名称，与序列号一一对应）。
-        若未配置序列号则不启动相机管理器。
-        """
-        try:
-            from ..core.config_loader import Config
-            config = Config.get_instance()
-
-            provider = getattr(config, "CAMERA_PROVIDER", "auto").lower()
-            sn_str = getattr(config, "REALSENSE_DEVICE_SN", "")
-            names_str = getattr(config, "REALSENSE_DEVICE_NAMES", "")
-            serials = [s.strip() for s in sn_str.split(",") if s.strip()] if sn_str else []
-            names = [n.strip() for n in names_str.split(",") if n.strip()] if names_str else []
-            webcam_indexes_str = getattr(config, "WEBCAM_DEVICE_INDEXES", "0")
-            webcam_names_str = getattr(config, "WEBCAM_DEVICE_NAMES", "")
-            webcam_indexes = [int(x.strip()) for x in webcam_indexes_str.split(",") if x.strip()]
-            webcam_names = [n.strip() for n in webcam_names_str.split(",") if n.strip()] if webcam_names_str else []
-
-            if provider in ("webcam", "opencv") or (provider == "auto" and not serials):
-                cameras = [
-                    {"index": index, "name": webcam_names[i] if i < len(webcam_names) else f"webcam-{index}"}
-                    for i, index in enumerate(webcam_indexes or [0])
-                ]
-                self._camera_manager = OpenCVCameraManager(
-                    cameras=cameras,
-                    fps=30,
-                    width=640,
-                    height=480,
-                    jpeg_quality=85,
-                )
-                result = self._camera_manager.start()
-                logger.info(
-                    "OpenCV camera manager started: %d online, %d failed",
-                    result["started"], result["failed"],
-                )
-                print(f"OpenCV camera manager started: {result['started']} online, {result['failed']} failed")
-                return
-
-            if not serials:
-                logger.info("未配置相机序列号，跳过相机管理器初始化")
-                self._camera_manager = None
-                return
-
-            cameras = [
-                {"serial": serial, "name": names[i] if i < len(names) else serial}
-                for i, serial in enumerate(serials)
-            ]
-
-            self._camera_manager = RealSenseManager(
-                cameras=cameras,
-                fps=30,
-                width=640,
-                height=480,
-                jpeg_quality=85,
-            )
-            result = self._camera_manager.start()
-            logger.info(
-                "相机管理器已启动: %d 路在线, %d 路失败",
-                result["started"], result["failed"],
-            )
-            print(f"相机管理器已启动: {result['started']} 路在线, {result['failed']} 路失败")
-        except Exception as exc:
-            logger.info("相机管理器未启动 (%s)", exc)
-            self._camera_manager = None
+        """根据 CAMERA_PROVIDER 初始化相机管理器单例，详见 src/cameras/camera_factory.py。"""
+        self._camera_manager = get_camera_manager()
 
     async def _handle_camera_status(self, websocket, data: dict) -> None:
         """
