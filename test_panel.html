@@ -539,8 +539,8 @@ function handleMsg(d) {
     return;
   }
   if (ev === 'chat_data') {
-    // 将 raw 字符串传给现有的流式响应处理器
-    handleChatFrame(d.raw || '');
+    // 优先按新协议处理：稳定字段 + 完整 packet，必要时再回退到 raw
+    handleChatDataEvent(d);
     return;
   }
 
@@ -719,12 +719,54 @@ function setChatConn(on) {
   document.getElementById('sendBtn').disabled = !on;
 }
 
-function handleChatFrame(raw) {
+function handleChatDataEvent(data) {
   removeTyping();
 
+  // 先走后端已经规范化好的稳定字段，别再让前端自己重复猜协议。
+  if (data.type === 'prefill_done') return;
+
+  if (data.type === 'chunk') {
+    if (typeof data.text_delta === 'string' && data.text_delta) {
+      appendAiDelta(data.text_delta);
+    }
+    return;
+  }
+
+  if (data.type === 'done') {
+    if (typeof data.text === 'string') {
+      setAiText(data.text);
+    }
+    finalizeAi();
+    return;
+  }
+
+  if (data.type === 'error') {
+    log('MiniCPM chat error: ' + (data.error || 'unknown error'), 'e');
+    finalizeAi();
+    return;
+  }
+
+  // 未知包型优先尝试完整 packet，其次才回退 raw，兼容新旧两种协议。
+  if (data.packet && typeof data.packet === 'object') {
+    handleChatPacket(data.packet);
+    return;
+  }
+  if (typeof data.raw === 'string' && data.raw) {
+    handleChatFrame(data.raw);
+    return;
+  }
+  if (typeof data.text === 'string' && data.text) {
+    appendAiDelta(data.text);
+  }
+}
+
+function handleChatFrame(raw) {
   let d;
   try { d = JSON.parse(raw); } catch { appendAiDelta(raw); return; }
+  handleChatPacket(d);
+}
 
+function handleChatPacket(d) {
   if (typeof d.text_delta === 'string') { appendAiDelta(d.text_delta); return; }
   if (typeof d.delta === 'string')      { appendAiDelta(d.delta); return; }
 

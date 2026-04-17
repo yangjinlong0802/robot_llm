@@ -452,7 +452,7 @@ ws.onmessage = (event) => {
 | `minicpm_status` | MiniCPM 代理状态 |
 | `chat_connected` | 聊天会话已建立 |
 | `chat_disconnected` | 聊天会话已关闭 |
-| `chat_data` | MiniCPM 聊天响应（每条上游帧推送一次） |
+| `chat_data` | MiniCPM 聊天响应（每条上游帧推送一次，服务端已做规范化） |
 | `minicpm_instruction` | 检测到机器人可执行指令 |
 
 `chat_data` 事件结构：
@@ -460,7 +460,14 @@ ws.onmessage = (event) => {
 ```json
 {
   "event": "chat_data",
-  "raw": "{...gateway payload...}"
+  "type": "chunk",
+  "text_delta": "你好",
+  "audio_data": "<base64,24kHz>",
+  "packet": {
+    "type": "chunk",
+    "text_delta": "你好",
+    "audio_data": "<base64,24kHz>"
+  }
 }
 ```
 
@@ -468,9 +475,13 @@ ws.onmessage = (event) => {
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `raw` | `string` | 上游 MiniCPM 网关的原始文本，前端需根据网关协议自行解析 |
+| `type` | `string` | 规范化后的包类型，如 `prefill_done` / `chunk` / `done` / `error` / `unknown` |
+| `text_delta` | `string` | 流式增量文本，仅 `chunk` 时出现 |
+| `audio_data` | `string \| null` | Base64 编码的音频片段或完整音频，仅语音输出时可能出现 |
+| `packet` | `object \| array \| string \| number \| boolean \| null` | 上游 MiniCPM 网关返回的完整已解析 JSON 包，前端如需兼容新增字段，优先从这里读取 |
+| `raw` | `string` | 可选调试字段，仅在 `error` / `unknown` / 非 JSON 兜底场景返回；正常业务逻辑不要依赖它 |
 
-注意：每条上游帧对应一次 `chat_data` 推送，流式响应时会收到多条。
+注意：每条上游帧对应一次 `chat_data` 推送，流式响应时会收到多条。正常业务应优先消费顶层稳定字段，`packet` 作为完整透传补充，`raw` 只用于联调排查。
 
 ---
 
@@ -2228,7 +2239,11 @@ function toImageSrc(frame) {
 {
   "event": "chat_data",
   "type": "prefill_done",
-  "input_tokens": 151
+  "input_tokens": 151,
+  "packet": {
+    "type": "prefill_done",
+    "input_tokens": 151
+  }
 }
 ```
 
@@ -2236,7 +2251,13 @@ function toImageSrc(frame) {
 {
   "event": "chat_data",
   "type": "chunk",
-  "text_delta": "这是摄像头的视角范围。"
+  "text_delta": "这是摄像头的视角范围。",
+  "audio_data": "<base64,24kHz>",
+  "packet": {
+    "type": "chunk",
+    "text_delta": "这是摄像头的视角范围。",
+    "audio_data": "<base64,24kHz>"
+  }
 }
 ```
 
@@ -2247,7 +2268,29 @@ function toImageSrc(frame) {
   "text": "这是摄像头的视角范围。",
   "generated_tokens": 1,
   "input_tokens": 151,
-  "recording_session_id": "chat_xxx"
+  "audio_data": "<base64,24kHz>",
+  "recording_session_id": "chat_xxx",
+  "packet": {
+    "type": "done",
+    "text": "这是摄像头的视角范围。",
+    "generated_tokens": 1,
+    "input_tokens": 151,
+    "audio_data": "<base64,24kHz>",
+    "recording_session_id": "chat_xxx"
+  }
+}
+```
+
+```json
+{
+  "event": "chat_data",
+  "type": "error",
+  "error": "tts engine unavailable",
+  "packet": {
+    "type": "error",
+    "error": "tts engine unavailable"
+  },
+  "raw": "{\"type\":\"error\",\"error\":\"tts engine unavailable\"}"
 }
 ```
 
@@ -2255,16 +2298,48 @@ function toImageSrc(frame) {
 {
   "event": "chat_data",
   "type": "unknown",
-  "text": "{...gateway payload...}"
+  "text": "{\"type\":\"vendor_extra\",\"foo\":\"bar\"}",
+  "packet": {
+    "type": "vendor_extra",
+    "foo": "bar"
+  },
+  "raw": "{\"type\":\"vendor_extra\",\"foo\":\"bar\"}"
 }
 ```
 
 字段说明：
 
-- `type = prefill_done`：上游已完成预填充，通常可忽略
-- `type = chunk`：流式增量文本，前端应持续拼接 `text_delta`
-- `type = done`：单轮回复结束，`text` 为最终完整文本
-- `type = unknown`：后端无法识别的上游包，原始文本放在 `text` 中
+- `type = prefill_done`：上游已完成预填充，通常可忽略；如需展示统计信息，可读取 `input_tokens`
+- `type = chunk`：流式增量文本，前端应持续拼接 `text_delta`；若存在 `audio_data`，表示当前 chunk 对应的语音片段
+- `type = done`：单轮回复结束，`text` 为最终完整文本；若存在 `audio_data`，通常表示完整音频或最后一段音频
+- `type = error`：上游聊天链路返回错误信息，前端应停止当前流式渲染并提示用户；此时会额外带 `raw` 便于排障
+- `type = unknown`：后端无法识别的上游包；`text` 是原始文本，`packet` 是已解析成功的完整 JSON（如果能解析），并保留 `raw` 便于联调
+- `packet`：服务端对上游完整 JSON 包的透传。顶层字段用于稳定消费，`packet` 用于读取新增字段、厂商扩展字段或未来版本兼容字段
+- `raw`：仅用于调试和兜底，不应再作为前端主业务协议入口
+
+语音输出请求写法：
+
+```json
+{
+  "action": "chat",
+  "messages": [
+    {
+      "role": "user",
+      "content": "请介绍一下你看到的画面"
+    }
+  ],
+  "streaming": true,
+  "tts": {
+    "enabled": true
+  }
+}
+```
+
+联调结论（基于当前部署的 MiniCPM 网关实测）：
+
+- 若希望上游返回 `audio_data`，应优先使用 `tts: { "enabled": true }`
+- `tts: true` 这种布尔写法，当前网关会直接返回 `type = error`
+- `tts_config` 不保证在当前网关实现中生效；如果前端传了它却收不到 `audio_data`，先改回 `tts` 对象格式再排查
 
 前端接收后的推荐处理流程：
 
@@ -2273,25 +2348,35 @@ function toImageSrc(frame) {
 3. 发送 `chat` 请求后，前端开始等待 `event = chat_data` 的消息流。
 4. 收到 `type = prefill_done` 时，不需要渲染正文；如需展示调试信息，可记录 `input_tokens`。
 5. 收到 `type = chunk` 时，将 `text_delta` 追加到当前这条助手占位消息中，并立即刷新界面，形成打字机效果。
-6. 收到 `type = done` 时，将当前这条助手消息状态改为 `done`，并用 `text` 作为最终权威文本；如果前面已经累积过若干 `chunk`，仍建议以 `done.text` 为最终落库内容。
-7. 收到 `type = unknown` 时，不要再尝试 `JSON.parse`；应把 `text` 当作普通原始文本处理，可展示到调试面板，或作为兜底文本显示。
-8. 收到 `event = error` 时，应把当前助手占位消息标记为失败，并将错误信息展示给用户。
-9. 页面关闭、切换会话、或确认不再继续聊天时，再调用 `chat_disconnect` 释放聊天会话。
+6. 如果 `chunk.audio_data` 有值，前端应将其视为 Base64 音频片段，交给音频播放缓冲区、解码器或播放器队列处理。
+7. 如果业务还需要使用上游新增字段、音频元信息、厂商扩展参数等，不要再从 `raw` 里手搓 `JSON.parse`，而是直接读取 `data.packet.xxx`。
+8. 收到 `type = done` 时，将当前这条助手消息状态改为 `done`，并用 `text` 作为最终权威文本；如果前面已经累积过若干 `chunk`，仍建议以 `done.text` 为最终落库内容。
+9. 如果 `done.audio_data` 有值，前端应将其作为完整音频或最后一段音频处理；不要假设语音一定只会出现在 `done` 或一定只会出现在 `chunk`。
+10. 收到 `type = error` 时，应停止本轮流式输出，将错误信息展示给用户；如需排障，可记录 `raw` 和 `packet`。
+11. 收到 `type = unknown` 时，不要把它当成正式业务包处理；应把 `text` / `packet` 记录到调试面板，作为未来兼容的观察入口。
+12. 收到 `event = error` 时，应把当前助手占位消息标记为失败，并将错误信息展示给用户。
+13. 页面关闭、切换会话、或确认不再继续聊天时，再调用 `chat_disconnect` 释放聊天会话。
 
 前端状态管理建议：
 
 - 当前协议的 `chat_data` 不带 `request_id`，因此同一个连接上，建议一轮回复结束前不要并发发送多条 `chat` 请求。
 - 最稳妥的做法是：上一轮收到 `type = done` 或 `event = error` 之前，发送按钮置灰，或由前端本地排队串行发送。
-- 前端不应再依赖旧版 `data.raw` 字段；当前版本应只按 `event = chat_data` 和 `type` 分发逻辑。
+- 前端主业务逻辑应优先消费顶层稳定字段；如需兼容上游新增字段，再读取 `data.packet`。
+- 前端不应只依赖 `data.raw` 做主业务逻辑；当前版本中，`raw` 默认只在 `error` / `unknown` / 非 JSON 兜底场景出现。
 - 如果需要统计本轮 token 或会话编号，可在 `done` 事件中读取 `generated_tokens`、`input_tokens`、`recording_session_id`。
+- 如果要支持语音播放，前端应同时处理 `chunk.audio_data` 和 `done.audio_data`，因为不同上游实现可能只在其中一种包型中携带音频。
+- 若当前请求未开启 TTS、网关未启用语音能力、或模型未返回语音，则 `audio_data` 可能始终缺失或为 `null`，这属于正常情况。
 
 推荐的前端分发伪代码：
 
 ```javascript
 let currentAssistantMessageId = null;
 let currentStreamText = "";
+let currentAudioChunks = [];
 
 function handleChatData(data) {
+  const packet = data.packet || {};
+
   switch (data.type) {
     case "prefill_done":
       updateChatMeta({ inputTokens: data.input_tokens });
@@ -2301,8 +2386,14 @@ function handleChatData(data) {
       if (!currentAssistantMessageId) {
         currentAssistantMessageId = createAssistantMessage({ text: "", status: "streaming" });
         currentStreamText = "";
+        currentAudioChunks = [];
       }
       currentStreamText += data.text_delta || "";
+      if (data.audio_data) {
+        currentAudioChunks.push(data.audio_data);
+        appendAudioChunk(data.audio_data);
+      }
+      // 如果后续有厂商扩展字段，例如 packet.audio_format，可在这里继续读取。
       updateMessage(currentAssistantMessageId, {
         text: currentStreamText,
         status: "streaming"
@@ -2320,12 +2411,32 @@ function handleChatData(data) {
         inputTokens: data.input_tokens,
         recordingSessionId: data.recording_session_id
       });
+      if (data.audio_data) {
+        currentAudioChunks.push(data.audio_data);
+      }
+      finalizeAudio(currentAudioChunks);
       currentAssistantMessageId = null;
       currentStreamText = "";
+      currentAudioChunks = [];
+      break;
+
+    case "error":
+      showChatError(data.error || "MiniCPM 返回错误");
+      appendDebugLog({
+        packet,
+        raw: data.raw || null
+      });
+      currentAssistantMessageId = null;
+      currentStreamText = "";
+      currentAudioChunks = [];
       break;
 
     case "unknown":
-      appendDebugLog(data.text);
+      appendDebugLog({
+        text: data.text,
+        packet,
+        raw: data.raw || null
+      });
       break;
   }
 }
@@ -2334,8 +2445,12 @@ function handleChatData(data) {
 补充说明：
 
 - `chunk` 负责流式展示，`done` 负责最终收口，两者不是二选一，而是一前一后配合使用。
+- `audio_data` 是可选字段，不是每一轮响应都一定返回。
+- 如果你打开了 TTS，但始终没有收到 `audio_data`，先检查请求体是否使用了 `tts: { "enabled": true }`，再确认上游网关当前模型/模式是否支持语音输出。
 - 如果本轮完全没有收到 `chunk`，前端仍应能只依赖 `done.text` 完成展示。
 - 如果收到了若干 `chunk`，但 `done.text` 与累计文本有差异，应优先信任 `done.text`，因为它代表后端确认后的完整结果。
+- `packet` 是完整透传的上游 JSON 包，作用是“字段不丢失、扩展字段可用”；顶层稳定字段的作用是“前端主流程不用再自己猜协议”。
+- `raw` 主要用于兼容未来上游协议变化和联调排查；如果响应中包含大段 Base64 音频，`raw` 体积会很大，因此默认不在正常 `chunk` / `done` / `prefill_done` 包里重复返回。
 - `unknown` 主要用于兼容未来上游协议变化，正常页面可以不展示给普通用户，但建议保留调试入口。
 
 ### 13.4 指令识别事件 `minicpm_instruction`
@@ -2438,7 +2553,7 @@ function handleChatData(data) {
 3. 用户发送消息时，先在本地插入用户气泡，再创建一条空的助手占位气泡
 4. 调用 `chat`
 5. 监听 `chat_data`
-6. 对 `prefill_done`、`chunk`、`done`、`unknown` 按协议分别处理
+6. 对 `prefill_done`、`chunk`、`done`、`error`、`unknown` 按协议分别处理
 7. 只有收到 `done` 或 `error` 后，才允许开始下一轮发送
 8. 若同时收到 `minicpm_instruction`，应将其视为“指令识别提示”或“规划入口”，不要当聊天正文显示
 9. 不再使用时调用 `chat_disconnect`

@@ -72,7 +72,7 @@ WebSocket 路径:
         {"event": "ai_execution_finished", "success": true, "message": "..."}
         {"event": "chat_connected"}                                    # 聊天会话已建立
         {"event": "chat_disconnected"}                                 # 聊天会话已断开
-        {"event": "chat_data",          "raw": "..."}                  # MiniCPM 聊天响应（每条上游帧推送一次，raw 为原始文本）
+        {"event": "chat_data",          "type": "chunk", ...}          # MiniCPM 聊天响应（规范化字段 + 完整 packet）
         {"event": "minicpm_instruction","instruction": "..."}          # 检测到可执行机器人指令
 
     log 事件 level 取值:
@@ -1955,44 +1955,71 @@ class RobotWebSocketServer:
 
     @staticmethod
     def _normalize_chat_data(raw) -> dict:
-        """将 MiniCPM 上游原始消息转换为稳定的 chat_data 结构。"""
+        """将 MiniCPM 上游原始消息转换为稳定字段 + 完整 packet 的 chat_data 结构。"""
         text = raw if isinstance(raw, str) else raw.decode("utf-8", errors="replace")
+        base_event = {"event": "chat_data"}
         try:
             packet = json.loads(text)
         except (TypeError, json.JSONDecodeError):
             return {
-                "event": "chat_data",
+                **base_event,
                 "type": "unknown",
                 "text": text,
+                # 仅在无法解析或无法识别时保留 raw，避免正常音频包重复放大体积。
+                "raw": text,
+            }
+
+        # 将上游原始 JSON 整包挂到 packet，前端如需兼容新增字段可直接读取。
+        base_event = {
+            **base_event,
+            "packet": packet,
+        }
+
+        if not isinstance(packet, dict):
+            return {
+                **base_event,
+                "type": "unknown",
+                "text": text,
+                "raw": text,
             }
 
         packet_type = packet.get("type")
         if packet_type == "prefill_done":
             return {
-                "event": "chat_data",
+                **base_event,
                 "type": "prefill_done",
                 "input_tokens": packet.get("input_tokens"),
             }
         if packet_type == "chunk":
             return {
-                "event": "chat_data",
+                **base_event,
                 "type": "chunk",
                 "text_delta": packet.get("text_delta", ""),
+                "audio_data": packet.get("audio_data"),
             }
         if packet_type == "done":
             return {
-                "event": "chat_data",
+                **base_event,
                 "type": "done",
                 "text": packet.get("text", ""),
                 "generated_tokens": packet.get("generated_tokens"),
                 "input_tokens": packet.get("input_tokens"),
+                "audio_data": packet.get("audio_data"),
                 "recording_session_id": packet.get("recording_session_id"),
+            }
+        if packet_type == "error":
+            return {
+                **base_event,
+                "type": "error",
+                "error": packet.get("error", ""),
+                "raw": text,
             }
 
         return {
-            "event": "chat_data",
+            **base_event,
             "type": "unknown",
             "text": text,
+            "raw": text,
         }
 
     async def _minicpm_recv_once(self, client_ws, gw_ws) -> None:
